@@ -13,6 +13,10 @@ vim.opt.number = true
 -- Relative numbers
 vim.opt.relativenumber = true
 
+vim.o.tabstop = 4
+vim.o.softtabstop = 4
+vim.o.shiftwidth = 4
+
 -- Enable mouse mode, can be useful for resizing splits for example!
 vim.opt.mouse = 'a'
 
@@ -152,27 +156,27 @@ require('lazy').setup({
       require('which-key').setup()
 
       require('which-key').add {
-        { '<leader>b', group = 'Buffers' },
+        { '<leader>b',  group = 'Buffers' },
         { '<leader>b_', hidden = true },
-        { '<leader>c', group = 'Code' },
+        { '<leader>c',  group = 'Code' },
         { '<leader>c_', hidden = true },
-        { '<leader>d', group = 'Document' },
+        { '<leader>d',  group = 'Document' },
         { '<leader>d_', hidden = true },
-        { '<leader>f', group = 'Files' },
+        { '<leader>f',  group = 'Files' },
         { '<leader>f_', hidden = true },
-        { '<leader>h', group = 'Harpoon' },
+        { '<leader>h',  group = 'Harpoon' },
         { '<leader>h_', hidden = true },
-        { '<leader>m', group = 'Marks' },
+        { '<leader>m',  group = 'Marks' },
         { '<leader>m_', hidden = true },
-        { '<leader>r', group = 'Rename' },
+        { '<leader>r',  group = 'Rename' },
         { '<leader>r_', hidden = true },
-        { '<leader>s', group = 'Search' },
+        { '<leader>s',  group = 'Search' },
         { '<leader>s_', hidden = true },
-        { '<leader>t', group = 'Tests' },
+        { '<leader>t',  group = 'Tests' },
         { '<leader>t_', hidden = true },
-        { '<leader>w', group = 'Workspace' },
+        { '<leader>w',  group = 'Workspace' },
         { '<leader>w_', hidden = true },
-        { '<leader>i', group = 'Info' },
+        { '<leader>i',  group = 'Info' },
         { '<leader>i_', hidden = true },
       }
     end,
@@ -195,7 +199,7 @@ require('lazy').setup({
       { 'nvim-telescope/telescope-ui-select.nvim' },
 
       -- Useful for getting pretty icons, but requires a Nerd Font.
-      { 'nvim-tree/nvim-web-devicons', enabled = vim.g.have_nerd_font },
+      { 'nvim-tree/nvim-web-devicons',            enabled = vim.g.have_nerd_font },
     },
     config = function()
       -- [[ Configure Telescope ]]
@@ -241,11 +245,11 @@ require('lazy').setup({
       'WhoIsSethDaniel/mason-tool-installer.nvim',
 
       -- Useful status updates for LSP.
-      { 'j-hui/fidget.nvim', opts = {} },
+      { 'j-hui/fidget.nvim',       opts = {} },
 
       -- `neodev` configures Lua LSP for your Neovim config, runtime and plugins
       -- used for completion, annotations and signatures of Neovim apis
-      { 'folke/neodev.nvim', opts = {} },
+      { 'folke/neodev.nvim',       opts = {} },
     },
     config = function()
       vim.api.nvim_create_autocmd('LspAttach', {
