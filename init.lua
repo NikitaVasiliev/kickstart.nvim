@@ -134,18 +134,45 @@ require('lazy').setup({
   -- Detect tabstop and shiftwidth automatically
   'tpope/vim-sleuth',
   {
-    "CopilotC-Nvim/CopilotChat.nvim",
+    'CopilotC-Nvim/CopilotChat.nvim',
     dependencies = {
-      { "github/copilot.vim" },                       -- or zbirenbaum/copilot.lua
-      { "nvim-lua/plenary.nvim", branch = "master" }, -- for curl, log and async functions
+      { 'github/copilot.vim' }, -- or zbirenbaum/copilot.lua
+      { 'nvim-lua/plenary.nvim', branch = 'master' }, -- for curl, log and async functions
     },
-    build = "make tiktoken",                          -- Only on MacOS or Linux
+    build = 'make tiktoken', -- Only on MacOS or Linux
+    keys = {
+      {
+        '<leader>ccp',
+        function()
+          local actions = require 'CopilotChat.actions'
+          require('CopilotChat.integrations.telescope').pick(actions.prompt_actions())
+        end,
+        desc = 'CopilotChat - Prompt actions',
+      },
+      {
+        '<leader>ca',
+        function()
+          require('CopilotChat').open()
+        end,
+        desc = 'Open chat with assistant',
+      },
+      {
+        '<leader>cca',
+        function()
+          local input = vim.fn.input 'Quick Chat: '
+          if input ~= '' then
+            require('CopilotChat').ask(input, { selection = require('CopilotChat.select').buffer })
+          end
+        end,
+        desc = 'CopilotChat - Quick chat',
+      },
+    },
     opts = {
       mappings = {
         complete = {
-          insert = '<C-f>'
-        }
-      }
+          insert = '<C-f>',
+        },
+      },
       -- See Configuration section for options
     },
     -- See Commands section for default commands if you want to lazy load on them
@@ -172,27 +199,27 @@ require('lazy').setup({
       require('which-key').setup()
 
       require('which-key').add {
-        { '<leader>b',  group = 'Buffers' },
+        { '<leader>b', group = 'Buffers' },
         { '<leader>b_', hidden = true },
-        { '<leader>c',  group = 'Code' },
+        { '<leader>c', group = 'Code' },
         { '<leader>c_', hidden = true },
-        { '<leader>d',  group = 'Document' },
+        { '<leader>d', group = 'Document' },
         { '<leader>d_', hidden = true },
-        { '<leader>f',  group = 'Files' },
+        { '<leader>f', group = 'Files' },
         { '<leader>f_', hidden = true },
-        { '<leader>h',  group = 'Harpoon' },
+        { '<leader>h', group = 'Harpoon' },
         { '<leader>h_', hidden = true },
-        { '<leader>m',  group = 'Marks' },
+        { '<leader>m', group = 'Marks' },
         { '<leader>m_', hidden = true },
-        { '<leader>r',  group = 'Rename' },
+        { '<leader>r', group = 'Rename' },
         { '<leader>r_', hidden = true },
-        { '<leader>s',  group = 'Search' },
+        { '<leader>s', group = 'Search' },
         { '<leader>s_', hidden = true },
-        { '<leader>t',  group = 'Tests' },
+        { '<leader>t', group = 'Tests' },
         { '<leader>t_', hidden = true },
-        { '<leader>w',  group = 'Workspace' },
+        { '<leader>w', group = 'Workspace' },
         { '<leader>w_', hidden = true },
-        { '<leader>i',  group = 'Info' },
+        { '<leader>i', group = 'Info' },
         { '<leader>i_', hidden = true },
       }
     end,
@@ -215,7 +242,7 @@ require('lazy').setup({
       { 'nvim-telescope/telescope-ui-select.nvim' },
 
       -- Useful for getting pretty icons, but requires a Nerd Font.
-      { 'nvim-tree/nvim-web-devicons',            enabled = vim.g.have_nerd_font },
+      { 'nvim-tree/nvim-web-devicons', enabled = vim.g.have_nerd_font },
     },
     config = function()
       -- [[ Configure Telescope ]]
@@ -261,11 +288,11 @@ require('lazy').setup({
       'WhoIsSethDaniel/mason-tool-installer.nvim',
 
       -- Useful status updates for LSP.
-      { 'j-hui/fidget.nvim',       opts = {} },
+      { 'j-hui/fidget.nvim', opts = {} },
 
       -- `neodev` configures Lua LSP for your Neovim config, runtime and plugins
       -- used for completion, annotations and signatures of Neovim apis
-      { 'folke/neodev.nvim',       opts = {} },
+      { 'folke/neodev.nvim', opts = {} },
     },
     config = function()
       vim.api.nvim_create_autocmd('LspAttach', {
@@ -340,6 +367,7 @@ require('lazy').setup({
       -- Enable the following language servers
       local servers = {
         gopls = {},
+        goimports = {},
         clangd = {},
         lua_ls = {
           settings = {
