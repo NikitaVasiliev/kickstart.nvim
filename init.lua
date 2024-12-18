@@ -188,6 +188,38 @@ require('lazy').setup({
         topdelete = { text = '‾' },
         changedelete = { text = '~' },
       },
+      signs_staged_enable = true,
+      signcolumn = true, -- Toggle with `:Gitsigns toggle_signs`
+      numhl = false, -- Toggle with `:Gitsigns toggle_numhl`
+      linehl = false, -- Toggle with `:Gitsigns toggle_linehl`
+      word_diff = false, -- Toggle with `:Gitsigns toggle_word_diff`
+      watch_gitdir = {
+        follow_files = true,
+      },
+      auto_attach = true,
+      attach_to_untracked = false,
+      current_line_blame = true, -- Toggle with `:Gitsigns toggle_current_line_blame`
+      current_line_blame_opts = {
+        virt_text = true,
+        virt_text_pos = 'eol', -- 'eol' | 'overlay' | 'right_align'
+        delay = 1000,
+        ignore_whitespace = false,
+        virt_text_priority = 100,
+        use_focus = true,
+      },
+      current_line_blame_formatter = '<author>, <author_time:%Y-%m-%d> - <summary> (<abbrev_sha>)',
+      sign_priority = 6,
+      update_debounce = 100,
+      status_formatter = nil, -- Use default
+      max_file_length = 40000, -- Disable if file is longer than this (in lines)
+      preview_config = {
+        -- Options passed to nvim_open_win
+        border = 'single',
+        style = 'minimal',
+        relative = 'cursor',
+        row = 0,
+        col = 1,
+      },
     },
   },
 
@@ -700,6 +732,31 @@ require('lazy').setup({
     config = true,
   },
 
+  {
+    'sindrets/diffview.nvim',
+    dependencies = {
+      'nvim-lua/plenary.nvim',
+      'lewis6991/gitsigns.nvim',
+    },
+    config = true,
+    keys = {
+      { '<leader>Gd', '<cmd>DiffviewOpen<cr>', mode = { 'n' }, desc = 'Repo Diffview', nowait = true },
+      { '<leader>Gh', '<cmd>DiffviewFileHistory<cr>', mode = { 'n' }, desc = 'Repo history' },
+      { '<leader>Gf', '<cmd>DiffviewFileHistory --follow %<cr>', mode = { 'n' }, desc = 'File history' },
+      { '<leader>Gm', '<cmd>DiffviewOpen master<cr>', mode = { 'n' }, desc = 'Diff with master' },
+      {
+        '<leader>Gl',
+        function()
+          local current_line = vim.fn.line '.'
+          local file = vim.fn.expand '%'
+          -- DiffviewFileHistory --follow -L{current_line},{current_line}:{file}
+          local cmd = string.format('DiffviewFileHistory --follow -L%s,%s:%s', current_line, current_line, file)
+          vim.cmd(cmd)
+        end,
+        desc = 'Line history',
+      },
+    },
+  },
   -- Easy switch between files
   {
     'ThePrimeagen/harpoon',
