@@ -307,6 +307,7 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>ir', builtin.registers, { desc = 'Show registers' })
       vim.keymap.set('n', '<leader>ik', builtin.keymaps, { desc = 'Show keymaps' })
       vim.keymap.set('n', '<leader>bj', builtin.current_buffer_fuzzy_find, { desc = 'Current buffer fuzzy find' })
+      vim.keymap.set('n', '<leader>fc', builtin.commands, { desc = 'Find command' })
     end,
   },
 
