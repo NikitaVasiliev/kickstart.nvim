@@ -131,6 +131,14 @@ vim.opt.rtp:prepend(lazypath)
 --  To update plugins you can run `:Lazy update`
 
 require('lazy').setup({
+  {
+    'zbirenbaum/copilot.lua',
+    cmd = 'Copilot',
+    event = 'InsertEnter',
+    config = function()
+      require('copilot').setup {}
+    end,
+  },
   -- Detect tabstop and shiftwidth automatically
   'tpope/vim-sleuth',
   {
@@ -363,6 +371,7 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>ik', builtin.keymaps, { desc = 'Show keymaps' })
       vim.keymap.set('n', '<leader>bj', builtin.current_buffer_fuzzy_find, { desc = 'Current buffer fuzzy find' })
       vim.keymap.set('n', '<leader>fc', builtin.commands, { desc = 'Find command' })
+      vim.keymap.set('n', '<leader>fj', builtin.jumplist, { desc = 'Jumps' })
     end,
   },
 
