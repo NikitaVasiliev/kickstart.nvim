@@ -80,6 +80,7 @@ vim.keymap.set('n', '<C-h>', '<C-w><C-h>', { desc = 'Move focus to the left wind
 vim.keymap.set('n', '<C-l>', '<C-w><C-l>', { desc = 'Move focus to the right window' })
 vim.keymap.set('n', '<C-j>', '<C-w><C-j>', { desc = 'Move focus to the lower window' })
 vim.keymap.set('n', '<C-k>', '<C-w><C-k>', { desc = 'Move focus to the upper window' })
+vim.keymap.set('n', '<leader>fd', '<cmd>Telescope find_files find_command=find,.,-type,d<CR>', { desc = 'Find directories' })
 
 -- Set highlight on search, but clear on pressing <Esc> in normal mode
 vim.opt.hlsearch = true
@@ -96,6 +97,9 @@ vim.keymap.set('n', '<leader>bd', '<cmd>:bd<cr>', { desc = 'Delete Buffer' })
 
 -- [[ Git Keymaps ]]
 vim.keymap.set('n', '<leader>G', '<cmd>Neogit<cr>', { desc = 'Neogit' })
+
+-- [[ Git Keymaps ]]
+vim.keymap.set('n', '<leader>aC', '<cmd>AvanteClear<cr>', { desc = 'Clear' })
 
 -- [[ Files Keymaps ]]
 vim.keymap.set('n', '<leader>fm', function()
@@ -193,10 +197,10 @@ require('lazy').setup({
     opts = {
       -- add any opts here
       -- for example
-      provider = 'copilot',
       windows = {
         width = 50,
       },
+      provider = 'copilot',
     },
     -- if you want to build from source then do `make BUILD_FROM_SOURCE=true`
     build = 'make',
@@ -378,6 +382,9 @@ require('lazy').setup({
   -- LSP Configuration & Plugins
   {
     'neovim/nvim-lspconfig',
+    opts = {
+      enabled = true,
+    },
     dependencies = {
       -- Automatically install LSPs and related tools to stdpath for Neovim
       { 'williamboman/mason.nvim', config = true }, -- NOTE: Must be loaded before dependants
@@ -940,5 +947,51 @@ require('lazy').setup({
     },
   },
 })
+local actions = require 'telescope.actions'
+local action_state = require 'telescope.actions.state'
+
+local function for_each_file(prompt_bufnr)
+  local picker = action_state.get_current_picker(prompt_bufnr)
+  local selections = picker:get_multi_selection()
+  actions.close(prompt_bufnr)
+
+  for _, entry in ipairs(selections) do
+    local filepath = entry.path or entry.filename
+    if filepath then
+      -- Example: open each in a vertical split
+      vim.cmd('edit ' .. vim.fn.fnameescape(filepath))
+    end
+  end
+end
+
+local function grep_in_selected(prompt_bufnr)
+  local picker = action_state.get_current_picker(prompt_bufnr)
+  local selections = picker:get_multi_selection()
+  actions.close(prompt_bufnr)
+
+  local paths = {}
+  for _, entry in ipairs(selections) do
+    table.insert(paths, entry.path or entry.filename)
+  end
+
+  if #paths > 0 then
+    require('telescope.builtin').live_grep {
+      search_dirs = paths,
+    }
+  end
+end
+
+require('telescope').setup {
+  defaults = {
+    mappings = {
+      i = {
+        ['<C-e>'] = for_each_file, -- Ctrl+e executes your function
+        ['<C-g>'] = grep_in_selected,
+      },
+    },
+  },
+}
+
+-- vim: ts=2 sts=2 sw=2 et
 
 -- vim: ts=2 sts=2 sw=2 et
