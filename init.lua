@@ -74,6 +74,10 @@ vim.opt.scrolloff = 10
 -- [[ Basic Keymaps ]]
 -- `:help vim.keymap.set()`
 
+vim.keymap.set('n', '<leader>ft', function()
+  require('telescope').extensions.tab_switch.tabs()
+end, { desc = 'Telescope: switch tabs' })
+
 --  Use CTRL+<hjkl> to switch between windows
 --  `:help wincmd`
 vim.keymap.set('n', '<C-h>', '<C-w><C-h>', { desc = 'Move focus to the left window' })
@@ -105,6 +109,21 @@ vim.keymap.set('n', '<leader>aC', '<cmd>AvanteClear<cr>', { desc = 'Clear' })
 vim.keymap.set('n', '<leader>fm', function()
   require('mini.files').open(vim.api.nvim_buf_get_name(0), true)
 end, { desc = 'Files' })
+
+require 'translate' -- if you saved as lua/translate.lua
+vim.keymap.set('n', '<leader>dte', function()
+  require('translate').translate { lang = ':en' }
+end, { desc = 'Translate <cword> → :en (hover)' })
+
+-- Visual: translate selected collocation/phrase to English (brief)
+vim.keymap.set('v', '<leader>dte', function()
+  require('translate').translate { lang = ':en' }
+end, { desc = 'Translate selection → :en (hover)' })
+
+-- Example: quick Bulgarian
+vim.keymap.set({ 'n', 'v' }, '<leader>dtr', function()
+  require('translate').translate { lang = ':ru' }
+end, { desc = 'Translate to :ru (hover)' })
 
 -- [[ Basic Autocommands ]]
 --  See `:help lua-guide-autocommands`
@@ -656,12 +675,27 @@ require('lazy').setup({
         completion = { completeopt = 'menu,menuone,noinsert' },
         -- `:help ins-completion`
         mapping = cmp.mapping.preset.insert {
-          -- Select the next item
-          ['<Tab>'] = cmp.mapping.select_next_item(),
-          -- Select the previous item
-          ['<S-Tab>'] = cmp.mapping.select_prev_item(),
+          -- TAB: menu -> next | snippet jump/expand | trigger completion | fallback (indent)
+          ['<Tab>'] = cmp.mapping(function(fallback)
+            if cmp.visible() then
+              cmp.select_next_item()
+            elseif luasnip.expand_or_jumpable() then
+              luasnip.expand_or_jump()
+            else
+              fallback()
+            end
+          end, { 'i', 's' }),
 
-          -- Scroll the documentation window back / forward
+          -- SHIFT+TAB: menu -> prev | snippet jump backward | fallback
+          ['<S-Tab>'] = cmp.mapping(function(fallback)
+            if cmp.visible() then
+              cmp.select_prev_item()
+            elseif luasnip.jumpable(-1) then
+              luasnip.jump(-1)
+            else
+              fallback()
+            end
+          end, { 'i', 's' }), -- Scroll the documentation window back / forward
           ['<C-b>'] = cmp.mapping.scroll_docs(-4),
           ['<C-f>'] = cmp.mapping.scroll_docs(4),
 
@@ -950,6 +984,23 @@ require('lazy').setup({
 local actions = require 'telescope.actions'
 local action_state = require 'telescope.actions.state'
 
+require('telescope').setup {
+  pickers = {
+    buffers = {
+      sort_mru = true,
+      ignore_current_buffer = true,
+      mappings = {
+        i = {
+          ['<C-d>'] = actions.delete_buffer, -- delete selected buffer
+        },
+        n = {
+          ['dd'] = actions.delete_buffer, -- vimmy delete
+        },
+      },
+    },
+  },
+}
+
 local function for_each_file(prompt_bufnr)
   local picker = action_state.get_current_picker(prompt_bufnr)
   local selections = picker:get_multi_selection()
@@ -991,7 +1042,31 @@ require('telescope').setup {
     },
   },
 }
+require('telescope').load_extension 'tab_switch'
 
--- vim: ts=2 sts=2 sw=2 et
+-- Extend mini.files with a custom mapping
+local MiniFiles = require 'mini.files'
 
+-- Function to create a tmux session from the current directory
+local function create_tmux_session()
+  local cwd = MiniFiles.get_fs_entry().path
+  local dir_path = vim.fn.fnamemodify(cwd, ':p:h') -- parent dir
+  local dir_name = vim.fn.fnamemodify(dir_path, ':t') -- last component
+
+  local cmd = string.format('tmux new-session -d -s %s -c %s', dir_name, dir_path)
+  vim.fn.system(cmd)
+
+  vim.notify("Tmux session '" .. dir_name .. "' created in " .. dir_path, vim.log.levels.INFO)
+end
+
+-- Map Ctrl-s inside mini.files buffer
+vim.api.nvim_create_autocmd('User', {
+  pattern = 'MiniFilesBufferCreate',
+
+  callback = function(args)
+    local buf_id = args.data.buf_id
+
+    vim.keymap.set('n', '<leader>n', create_tmux_session, { buffer = buf_id, desc = 'Create tmux session' })
+  end,
+})
 -- vim: ts=2 sts=2 sw=2 et
