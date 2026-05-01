@@ -119,7 +119,8 @@ return {
 
         local dir_path = vim.fn.fnamemodify(entry.path, ":p:h")
         local dir_name = vim.fn.fnamemodify(dir_path, ":t")
-        local cmd = string.format("tmux new-session -d -s %s -c %s", vim.fn.shellescape(dir_name), vim.fn.shellescape(dir_path))
+        local cmd =
+          string.format("tmux new-session -d -s %s -c %s", vim.fn.shellescape(dir_name), vim.fn.shellescape(dir_path))
         vim.fn.system(cmd)
         vim.notify("Tmux session '" .. dir_name .. "' created in " .. dir_path, vim.log.levels.INFO)
       end
@@ -133,20 +134,6 @@ return {
           })
         end,
       })
-    end,
-  },
-  {
-    url = "https://codeberg.org/andyg/leap.nvim.git",
-    event = "VeryLazy",
-    opts = {
-      safe_labels = "",
-    },
-    config = function(_, opts)
-      local leap = require("leap")
-      for k, v in pairs(opts) do
-        leap.opts[k] = v
-      end
-      leap.add_default_mappings(true)
     end,
   },
 }
