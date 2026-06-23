@@ -264,12 +264,10 @@ local function overlay_buffer(bufnr, path, side)
     return
   end
   api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
-  local threads = s.threads.by_path[path]
-  if not threads then
-    return
-  end
+  -- place signs only for existing threads, but always wire the keymaps below so
+  -- you can add a comment on a file that has no comments yet
   local placed = {}
-  for _, t in ipairs(threads) do
+  for _, t in ipairs(s.threads.by_path[path] or {}) do
     local ln = thread_line(t, side)
     if ln and ln >= 1 then
       placed[ln] = t
