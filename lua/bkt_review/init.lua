@@ -1544,7 +1544,8 @@ function M.pick(extra)
       vim.ui.select(list, {
         prompt = "Bitbucket PR",
         format_item = function(p)
-          return ("#%s  [%s] %s"):format(first(p.id, p.number), first(p.state, "?"), first(p.title, "?"))
+          local author = dig(p, "author", "display_name") or dig(p, "author", "nickname") or dig(p, "author", "name") or "?"
+          return ("#%s  [%s]  %s  — %s"):format(first(p.id, p.number), first(p.state, "?"), first(p.title, "?"), author)
         end,
       }, function(choice)
         if choice then
