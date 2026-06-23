@@ -1340,15 +1340,27 @@ function M.pipeline_logs(id, step)
   end
 end
 
--- names defined under pipelines.custom in bitbucket-pipelines.yml
-local function custom_pipelines(dir)
-  local path = dir .. "/bitbucket-pipelines.yml"
-  if vim.fn.filereadable(path) == 0 then
-    return {}
+-- names defined under pipelines.custom in bitbucket-pipelines.yml.
+-- reads the selected ref's file (origin/<ref>) so the options match the branch
+-- being triggered, falling back to the working copy.
+local function custom_pipelines(dir, ref)
+  local lines
+  if ref then
+    local out = vim.fn.systemlist({ "git", "-C", dir, "show", ("origin/%s:bitbucket-pipelines.yml"):format(ref) })
+    if vim.v.shell_error == 0 and out[1] then
+      lines = out
+    end
+  end
+  if not lines then
+    local path = dir .. "/bitbucket-pipelines.yml"
+    if vim.fn.filereadable(path) == 0 then
+      return {}
+    end
+    lines = vim.fn.readfile(path)
   end
   local in_pipelines, in_custom, custom_indent = false, false, nil
   local names = {}
-  for _, line in ipairs(vim.fn.readfile(path)) do
+  for _, line in ipairs(lines) do
     if not (line:match("^%s*#") or line:match("^%s*$")) then
       local indent = #(line:match("^(%s*)"))
       local key = line:match("^%s*([%w%._/%-]+):")
@@ -1416,7 +1428,7 @@ function M.pipeline_run()
     if not ref or ref == "" then
       return
     end
-    local customs = custom_pipelines(cwd())
+    local customs = custom_pipelines(cwd(), ref) -- from the selected ref's yml
     if #customs == 0 then
       return trigger(ref, nil) -- only the default/branch pipeline exists
     end
