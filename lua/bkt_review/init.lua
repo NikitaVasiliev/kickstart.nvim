@@ -887,6 +887,71 @@ function M.open_in_browser()
   notify("opening " .. url)
 end
 
+-- ── approve / request-changes toggles (Cloud participant endpoints) ─────────
+-- resolve my current participant status; cb(approved_bool, changes_bool)
+local function pr_my_status(s, cb)
+  local function finish(me)
+    bkt_json({ "api", ("/repositories/%s/%s/pullrequests/%s"):format(s.ws, s.slug, s.id) }, s.wt, function(pr)
+      local approved, changes = false, false
+      for _, p in ipairs((pr and as_list(pr.participants)) or {}) do
+        if dig(p, "user", "account_id") == me or dig(p, "user", "uuid") == me then
+          approved = val(p.approved) == true
+          changes = val(p.state) == "changes_requested"
+        end
+      end
+      cb(approved, changes)
+    end)
+  end
+  if M._me then
+    finish(M._me)
+  else
+    bkt_json({ "api", "/user" }, s.wt, function(u)
+      M._me = u and first(u.account_id, u.uuid)
+      finish(M._me)
+    end)
+  end
+end
+
+local function pr_endpoint(s, suffix)
+  return ("/repositories/%s/%s/pullrequests/%s/%s"):format(s.ws, s.slug, s.id, suffix)
+end
+
+function M.toggle_approve()
+  local s = M.active
+  if not s then
+    return notify("no active review — open one with :BktPr")
+  end
+  if not (s.ws and s.slug) then
+    return notify("workspace/repo unknown — cannot approve", vim.log.levels.WARN)
+  end
+  pr_my_status(s, function(approved)
+    api_call(pr_endpoint(s, "approve"), approved and "DELETE" or "POST", nil, function(ok, out)
+      if not ok then
+        return notify("approve toggle failed: " .. out, vim.log.levels.ERROR)
+      end
+      notify(approved and "approval removed" or "PR approved ✓")
+    end)
+  end)
+end
+
+function M.toggle_changes()
+  local s = M.active
+  if not s then
+    return notify("no active review — open one with :BktPr")
+  end
+  if not (s.ws and s.slug) then
+    return notify("workspace/repo unknown — cannot request changes", vim.log.levels.WARN)
+  end
+  pr_my_status(s, function(_, changes)
+    api_call(pr_endpoint(s, "request-changes"), changes and "DELETE" or "POST", nil, function(ok, out)
+      if not ok then
+        return notify("request-changes toggle failed: " .. out, vim.log.levels.ERROR)
+      end
+      notify(changes and "change request removed" or "changes requested")
+    end)
+  end)
+end
+
 -- ── export comments to revdiff format ───────────────────────────────────────
 local function append_thread_text(lines, t)
   local function add(c, depth)
@@ -1541,6 +1606,12 @@ function M.setup(opts)
   api.nvim_create_user_command("BktPrWeb", function()
     M.open_in_browser()
   end, {})
+  api.nvim_create_user_command("BktPrApprove", function()
+    M.toggle_approve()
+  end, {})
+  api.nvim_create_user_command("BktPrRequestChanges", function()
+    M.toggle_changes()
+  end, {})
   api.nvim_create_user_command("BktPrDraft", function()
     M.toggle_draft()
   end, {})
@@ -1592,6 +1663,12 @@ function M.setup(opts)
   map("o", function()
     M.open_in_browser()
   end, "open PR in browser")
+  map("A", function()
+    M.toggle_approve()
+  end, "toggle approve")
+  map("C", function()
+    M.toggle_changes()
+  end, "toggle request-changes")
   map("R", function()
     M.refresh()
   end, "refresh PR (fetch + comments)")
