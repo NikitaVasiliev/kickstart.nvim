@@ -120,8 +120,17 @@ local function bkt_json(args, cwd, cb)
 end
 
 local function cwd()
+  -- prefer the current file's dir, but fall back to the tab cwd when the
+  -- buffer has no real path (e.g. a diffview:// panel) — otherwise git/bkt
+  -- run in a bogus dir and switching PRs from inside a review fails.
   local f = api.nvim_buf_get_name(0)
-  return f ~= "" and vim.fs.dirname(f) or vim.fn.getcwd()
+  if f ~= "" then
+    local dir = vim.fs.dirname(f)
+    if vim.fn.isdirectory(dir) == 1 then
+      return dir
+    end
+  end
+  return vim.fn.getcwd()
 end
 
 -- ── comment normalization ───────────────────────────────────────────────────
@@ -705,33 +714,67 @@ local function sorted_threads(s)
   return items
 end
 
--- jump into the open Diffview at a thread's file + line
+-- jump into the open Diffview at a thread's file + line, then open the thread
 function M.goto_thread(t)
   local s = M.active
   if s and s.tab and api.nvim_tabpage_is_valid(s.tab) then
     api.nvim_set_current_tabpage(s.tab)
   end
   local line = t.to or t.from or 1
+  local side = t.to and "b" or "a" -- new side for `to`, old side for `from`
   local ok, lib = pcall(require, "diffview.lib")
   local view = ok and lib.get_current_view()
-  if view and t.path then
-    pcall(function()
-      for _, f in view.files:iter() do
-        if f.path == t.path then
-          view:set_file(f, true)
-          break
-        end
-      end
-    end)
-  elseif s and s.wt and t.path then
-    vim.cmd("edit " .. vim.fn.fnameescape(s.wt .. "/" .. t.path)) -- fallback when no view
-  end
-  vim.schedule(function()
-    pcall(api.nvim_win_set_cursor, 0, { line, 0 })
-    pcall(vim.cmd, "normal! zz")
-    -- open the thread itself, not just position the cursor
+
+  local function show_thread()
     open_float(thread_lines(t), ("%s:%s"):format(t.path or "?", line))
+  end
+
+  if not view or not t.path then
+    if s and s.wt and t.path then
+      vim.cmd("edit " .. vim.fn.fnameescape(s.wt .. "/" .. t.path))
+      pcall(api.nvim_win_set_cursor, 0, { line, 0 })
+      pcall(vim.cmd, "normal! zz")
+    end
+    return show_thread()
+  end
+
+  local same = view.cur_entry and view.cur_entry.path == t.path
+  pcall(function()
+    for _, f in view.files:iter() do
+      if f.path == t.path then
+        view:set_file(f, true)
+        break
+      end
+    end
   end)
+
+  -- focus the correct diff window and place the cursor; retry until the diff
+  -- buffer has finished loading (set_file is async), then open the thread.
+  local function place(attempts)
+    local v = lib.get_current_view()
+    local win = v and v.cur_layout and (v.cur_layout[side] or v.cur_layout:get_main_win())
+    if win and win.id and api.nvim_win_is_valid(win.id) then
+      local buf = api.nvim_win_get_buf(win.id)
+      local lc = api.nvim_buf_line_count(buf)
+      if lc < line and attempts > 0 then
+        return vim.defer_fn(function()
+          place(attempts - 1)
+        end, 50)
+      end
+      api.nvim_set_current_win(win.id)
+      pcall(api.nvim_win_set_cursor, win.id, { math.min(line, lc), 0 })
+      pcall(vim.cmd, "normal! zz")
+    end
+    show_thread()
+  end
+
+  if same then
+    place(0)
+  else
+    vim.defer_fn(function()
+      place(4)
+    end, 50)
+  end
 end
 
 -- Telescope (or vim.ui.select) picker over the active review's comment threads.
@@ -845,6 +888,138 @@ function M.open_in_browser()
   notify("opening " .. url)
 end
 
+-- ── export comments to revdiff format ───────────────────────────────────────
+local function append_thread_text(lines, t)
+  local function add(c, depth)
+    local pad = string.rep("  ", depth)
+    local arrow = depth > 0 and "↳ " or ""
+    local body = c.text ~= "" and c.text or "(no text)"
+    local parts = vim.split(body, "\n", { plain = true })
+    lines[#lines + 1] = ("%s%s%s%s: %s"):format(pad, arrow, c.author, c.resolved and " (resolved)" or "", parts[1])
+    for i = 2, #parts do
+      lines[#lines + 1] = pad .. "  " .. parts[i]
+    end
+    for _, r in ipairs(c.replies) do
+      add(r, depth + 1)
+    end
+  end
+  add(t, 0)
+end
+
+-- Write the active PR's comment threads as a revdiff history file (and show it).
+-- Format matches scripts/revdiff-review/README.md so the revdiff Claude skill
+-- consumes it via "use my latest revdiff annotations".
+function M.export_revdiff()
+  local s = M.active
+  if not s then
+    return notify("no active review — open one with :BktPr")
+  end
+  local inline = sorted_threads(s)
+  local generals = {}
+  for _, t in ipairs(s.threads.roots) do
+    if not t.path then
+      generals[#generals + 1] = t
+    end
+  end
+  if #inline == 0 and #generals == 0 then
+    return notify("no comments to export")
+  end
+
+  sh({ "git", "-C", s.wt, "rev-parse", "--short", "HEAD" }, nil, function(_, sha)
+    sha = vim.trim(sha or "")
+    local paths, seen = {}, {}
+    for _, t in ipairs(inline) do
+      if not seen[t.path] then
+        seen[t.path] = true
+        paths[#paths + 1] = t.path
+      end
+    end
+    local diffcmd = { "git", "-C", s.wt, "diff" }
+    if s.dst then
+      table.insert(diffcmd, "origin/" .. s.dst .. "...HEAD")
+    end
+    table.insert(diffcmd, "--")
+    vim.list_extend(diffcmd, paths)
+    sh(diffcmd, nil, function(_, diffout)
+      local lines = { "# Review: " .. os.date("%Y-%m-%d %H:%M:%S"), "path: " .. (s.wt or s.root or "") }
+      if sha ~= "" then
+        lines[#lines + 1] = "commit: " .. sha
+      end
+      vim.list_extend(lines, { "", "## Annotations", "" })
+      for _, t in ipairs(inline) do
+        local ln = t.to or t.from
+        lines[#lines + 1] = ln and ("## %s:%d (line)"):format(t.path, ln) or ("## %s (file-level)"):format(t.path)
+        append_thread_text(lines, t)
+        lines[#lines + 1] = ""
+      end
+      for _, t in ipairs(generals) do
+        lines[#lines + 1] = "## (general)"
+        append_thread_text(lines, t)
+        lines[#lines + 1] = ""
+      end
+      vim.list_extend(lines, { "---", "", "## Diff", "" })
+      if diffout and diffout ~= "" then
+        vim.list_extend(lines, vim.split(diffout, "\n", { plain = true }))
+      end
+
+      -- open in a fresh scratch buffer (no file written, nothing copied)
+      local buf = api.nvim_create_buf(true, true)
+      api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.bo[buf].filetype = "markdown"
+      pcall(api.nvim_buf_set_name, buf, ("bkt://pr/%s/revdiff.md"):format(s.id))
+      vim.cmd("tabnew")
+      api.nvim_win_set_buf(0, buf)
+      notify(("PR #%s comments in revdiff format — %d threads"):format(s.id, #inline + #generals))
+    end)
+  end)
+end
+
+-- re-fetch the PR (new commits + comments) and refresh the diff + overlay
+function M.refresh()
+  local s = M.active
+  if not s then
+    return notify("no active review — open one with :BktPr")
+  end
+  notify("refreshing PR #" .. s.id .. " …")
+
+  local function finish()
+    bkt_json({ "pr", "comments", tostring(s.id), "--details" }, s.wt, function(c)
+      if c then
+        s.threads = normalize_comments(as_list(c) or {})
+      end
+      if s.tab and api.nvim_tabpage_is_valid(s.tab) then
+        pcall(api.nvim_set_current_tabpage, s.tab)
+      end
+      pcall(vim.cmd, "DiffviewRefresh")
+      local bufnr = api.nvim_get_current_buf()
+      local info = M._buf and M._buf[bufnr]
+      if info and api.nvim_buf_is_valid(bufnr) then
+        overlay_buffer(bufnr, info.path, info.side)
+      end
+      notify(("PR #%s refreshed — %d threads"):format(s.id, #s.threads.roots))
+    end)
+  end
+
+  local function fetch_dest_then_finish()
+    sh({ "git", "-C", s.wt, "fetch", "origin", s.dst or "HEAD" }, nil, finish)
+  end
+
+  -- fetch everything, then fast-forward the PR branch if it moved (ff-only is
+  -- non-destructive: it won't clobber local commits/edits, just fails)
+  sh({ "git", "-C", s.wt, "fetch", "--all", "--prune" }, nil, function()
+    if s.src then
+      sh({ "git", "-C", s.wt, "merge", "--ff-only", "origin/" .. s.src }, nil, function(ok)
+        if not ok then
+          notify("PR branch not fast-forwarded (diverged/local changes) — comments+diff refreshed", vim.log.levels.WARN)
+        end
+        fetch_dest_then_finish()
+      end)
+    else
+      fetch_dest_then_finish()
+    end
+  end)
+end
+
 -- toggle the active PR between draft and ready (bkt pr publish [--undo])
 function M.toggle_draft()
   local s = M.active
@@ -951,6 +1126,12 @@ function M.setup(opts)
   api.nvim_create_user_command("BktPrDraft", function()
     M.toggle_draft()
   end, {})
+  api.nvim_create_user_command("BktPrRefresh", function()
+    M.refresh()
+  end, {})
+  api.nvim_create_user_command("BktPrRevdiff", function()
+    M.export_revdiff()
+  end, {})
   api.nvim_create_user_command("BktReviewClean", function()
     M.clean()
   end, {})
@@ -978,6 +1159,12 @@ function M.setup(opts)
   map("o", function()
     M.open_in_browser()
   end, "open PR in browser")
+  map("R", function()
+    M.refresh()
+  end, "refresh PR (fetch + comments)")
+  map("E", function()
+    M.export_revdiff()
+  end, "export comments → revdiff")
   map("D", function()
     M.toggle_draft()
   end, "toggle draft / ready")
