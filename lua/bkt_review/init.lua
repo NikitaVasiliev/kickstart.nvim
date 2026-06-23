@@ -213,6 +213,7 @@ local function open_float(lines, title)
   M._float_win = win
   vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf })
   vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", { buffer = buf })
+  return buf, win
 end
 
 local function thread_lines(t)
@@ -1039,6 +1040,413 @@ function M.toggle_draft()
   end)
 end
 
+-- ── pipelines (Bitbucket Cloud) ─────────────────────────────────────────────
+-- generic picker: telescope when available, else vim.ui.select
+local function select_one(items, opts, on_choice)
+  if not items or #items == 0 then
+    return notify(opts.empty or "nothing to select")
+  end
+  if not pcall(require, "telescope") then
+    return vim.ui.select(items, { prompt = opts.prompt, format_item = opts.label }, function(c)
+      if c then
+        on_choice(c)
+      end
+    end)
+  end
+  local pickers = require("telescope.pickers")
+  local finders = require("telescope.finders")
+  local conf = require("telescope.config").values
+  local actions = require("telescope.actions")
+  local astate = require("telescope.actions.state")
+  pickers
+    .new({}, {
+      prompt_title = opts.prompt,
+      finder = finders.new_table({
+        results = items,
+        entry_maker = function(it)
+          local disp = opts.label(it)
+          return { value = it, display = disp, ordinal = (opts.ordinal and opts.ordinal(it)) or disp }
+        end,
+      }),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(bufnr, map)
+        actions.select_default:replace(function()
+          actions.close(bufnr)
+          local e = astate.get_selected_entry()
+          if e then
+            on_choice(e.value)
+          end
+        end)
+        for lhs, fn in pairs(opts.actions or {}) do
+          map({ "i", "n" }, lhs, function()
+            actions.close(bufnr)
+            local e = astate.get_selected_entry()
+            if e then
+              fn(e.value)
+            end
+          end)
+        end
+        return true
+      end,
+    })
+    :find()
+end
+
+local function remote_ws_slug(dir)
+  local url = (vim.fn.systemlist({ "git", "-C", dir, "remote", "get-url", "origin" })[1] or "")
+  local ws, slug = url:match("bitbucket%.org[:/]([^/]+)/([^/]+)")
+  if slug then
+    slug = slug:gsub("%.git$", "")
+  end
+  return ws, slug
+end
+
+-- fetch recent runs with rich target data (PR/branch) via the raw API, falling
+-- back to bkt's plain list when ws/slug or the API call is unavailable
+local function fetch_pipelines(cb)
+  local ws, slug = remote_ws_slug(cwd())
+  local function plain()
+    bkt_json({ "pipeline", "list", "--limit", "30" }, cwd(), function(d)
+      cb(as_list(d) or {})
+    end)
+  end
+  if not (ws and slug) then
+    return plain()
+  end
+  bkt_json({
+    "api",
+    ("/repositories/%s/%s/pipelines/"):format(ws, slug),
+    "--param",
+    "sort=-created_on",
+    "--param",
+    "pagelen=30",
+  }, cwd(), function(data)
+    if data then
+      cb(as_list(data) or {})
+    else
+      plain()
+    end
+  end)
+end
+
+local STATUS_ICON = { SUCCESSFUL = "✓", FAILED = "✗", STOPPED = "■", ERROR = "✗", EXPIRED = "■" }
+
+local function pipeline_status(p)
+  local res = dig(p, "state", "result", "name") or dig(p, "result", "name")
+  if res and res ~= "" then
+    return ("%s %s"):format(STATUS_ICON[res] or "•", res:lower())
+  end
+  local st = dig(p, "state", "name") or ""
+  local stage = dig(p, "state", "stage", "name")
+  if st == "IN_PROGRESS" or stage == "RUNNING" then
+    return "● running"
+  end
+  if st == "PENDING" then
+    return "◌ pending"
+  end
+  return "• " .. (st ~= "" and st:lower() or "?")
+end
+
+local function pipeline_target(p)
+  local pr = dig(p, "target", "pullrequest")
+  if pr then
+    return ("PR #%s %s"):format(tostring(first(pr.id, "?")), first(pr.title, "") or "")
+  end
+  local ref = dig(p, "target", "ref_name") or dig(p, "target", "ref", "name")
+  if ref and ref ~= "" then
+    return ref
+  end
+  local src = dig(p, "target", "source")
+  if src then
+    return src .. " → " .. (dig(p, "target", "destination") or "?")
+  end
+  return (dig(p, "target", "type") or "-"):gsub("^pipeline_", ""):gsub("_target$", "")
+end
+
+local function pipeline_label(p)
+  local created = (first(p.created_on, "") or ""):sub(1, 16):gsub("T", " ")
+  return ("#%-4s %-11s %s  %s"):format(
+    tostring(first(p.build_number, "?")),
+    pipeline_status(p),
+    created,
+    pipeline_target(p)
+  )
+end
+
+local function pipeline_id(p)
+  return tostring(first(p.build_number, p.uuid))
+end
+
+local function show_buffer(lines, name, ft)
+  local buf = api.nvim_create_buf(true, true)
+  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = ft or "markdown"
+  pcall(api.nvim_buf_set_name, buf, name)
+  vim.cmd("tabnew")
+  api.nvim_win_set_buf(0, buf)
+end
+
+-- pick a recent pipeline run, then call cb(id)
+local function pipeline_choose(prompt, cb)
+  fetch_pipelines(function(list)
+    select_one(list, { prompt = prompt, label = pipeline_label, empty = "no pipelines" }, function(p)
+      cb(pipeline_id(p))
+    end)
+  end)
+end
+
+-- List: fzf-style picker of recent runs; <CR> view, <C-l> logs
+function M.pipeline_list()
+  fetch_pipelines(function(list)
+    select_one(list, {
+      prompt = "Pipelines",
+      label = pipeline_label,
+      empty = "no pipelines",
+      actions = {
+        ["<C-l>"] = function(p)
+          M.pipeline_logs(pipeline_id(p))
+        end,
+      },
+    }, function(p)
+      M.pipeline_view(pipeline_id(p))
+    end)
+  end)
+end
+
+-- rerun the entire pipeline by re-triggering its target (raw API)
+function M.pipeline_rerun(p)
+  local ws, slug = remote_ws_slug(cwd())
+  if not (ws and slug) then
+    return notify("can't derive workspace/repo to rerun", vim.log.levels.WARN)
+  end
+  local t = val(p.target) or {}
+  local target
+  if t.ref_name then
+    target = { ref_type = t.ref_type or "branch", type = "pipeline_ref_target", ref_name = t.ref_name }
+  elseif t.source then
+    target = { type = "pipeline_pullrequest_target", source = t.source }
+    if t.destination then
+      target.destination = t.destination
+    end
+    if dig(t, "pullrequest", "id") then
+      target.pullrequest = { id = t.pullrequest.id }
+    end
+  else
+    return notify("can't determine pipeline target to rerun", vim.log.levels.WARN)
+  end
+  if dig(t, "selector", "pattern") then
+    target.selector = { type = t.selector.type, pattern = t.selector.pattern }
+  end
+  notify("rerunning pipeline …")
+  sh({
+    config.bkt,
+    "api",
+    ("/repositories/%s/%s/pipelines/"):format(ws, slug),
+    "--method",
+    "POST",
+    "--input",
+    vim.json.encode({ target = target }),
+  }, cwd(), function(ok, out, err)
+    if not ok then
+      return notify("rerun failed: " .. (err ~= "" and err or out), vim.log.levels.ERROR)
+    end
+    local okj, resp = pcall(vim.json.decode, out)
+    local n = okj and dig(resp, "build_number")
+    notify(n and ("rerun triggered → #" .. n) or "rerun triggered")
+  end)
+end
+
+-- View: pick a run, show a readable step breakdown with actions
+function M.pipeline_view(id)
+  if not id then
+    return pipeline_choose("View pipeline", function(pid)
+      M.pipeline_view(pid)
+    end)
+  end
+  id = tostring(id)
+  M._last_pipeline = id -- remember for :BktPipelineLast / <leader>pPV
+  bkt_json({ "pipeline", "view", id }, cwd(), function(data, err)
+    if not data then
+      return notify("pipeline view failed: " .. err, vim.log.levels.ERROR)
+    end
+    local p = data.pipeline or data
+    local steps = as_list(data.steps) or {}
+    local build = tostring(first(p.build_number, id))
+    local lines = {
+      ("Pipeline #%s   %s"):format(build, pipeline_status(p)),
+      pipeline_target(p),
+      "",
+      "Steps:",
+    }
+    local step_at = {}
+    for _, st in ipairs(steps) do
+      lines[#lines + 1] = ("  %-13s %s"):format(pipeline_status(st), st.name or "?")
+      step_at[#lines] = st
+    end
+    vim.list_extend(lines, { "", "<CR> step logs · L all logs · r rerun · q close" })
+
+    local buf, win = open_float(lines, "pipeline #" .. build)
+    vim.wo[win].wrap = false
+    local function km(lhs, fn)
+      vim.keymap.set("n", lhs, fn, { buffer = buf })
+    end
+    km("<CR>", function()
+      local st = step_at[api.nvim_win_get_cursor(0)[1]]
+      if st then
+        pcall(api.nvim_win_close, win, true)
+        M.pipeline_logs(build, st.uuid)
+      end
+    end)
+    km("L", function()
+      pcall(api.nvim_win_close, win, true)
+      M.pipeline_logs(build)
+    end)
+    km("r", function()
+      pcall(api.nvim_win_close, win, true)
+      M.pipeline_rerun(p)
+    end)
+  end)
+end
+
+-- View the most recently viewed pipeline again
+function M.pipeline_view_last()
+  if not M._last_pipeline then
+    return notify("no pipeline viewed yet — use the list/view picker first")
+  end
+  M.pipeline_view(M._last_pipeline)
+end
+
+-- Logs: fetch logs into a new buffer (optionally for a specific step)
+function M.pipeline_logs(id, step)
+  local function go(pid)
+    notify("fetching logs for pipeline #" .. pid .. " …")
+    local cmd = { config.bkt, "pipeline", "logs", tostring(pid) }
+    if step then
+      vim.list_extend(cmd, { "--step", step })
+    end
+    sh(cmd, cwd(), function(ok, out, err)
+      local text = (out and out ~= "" and out) or err
+      if not ok and (not out or out == "") then
+        return notify("pipeline logs failed: " .. err, vim.log.levels.ERROR)
+      end
+      local name = step and ("bkt://pipeline/%s/step-logs"):format(pid) or ("bkt://pipeline/%s/logs"):format(pid)
+      show_buffer(vim.split(text, "\n", { plain = true }), name, "log")
+    end)
+  end
+  if id then
+    go(id)
+  else
+    pipeline_choose("Logs for pipeline", go)
+  end
+end
+
+-- names defined under pipelines.custom in bitbucket-pipelines.yml
+local function custom_pipelines(dir)
+  local path = dir .. "/bitbucket-pipelines.yml"
+  if vim.fn.filereadable(path) == 0 then
+    return {}
+  end
+  local in_pipelines, in_custom, custom_indent = false, false, nil
+  local names = {}
+  for _, line in ipairs(vim.fn.readfile(path)) do
+    if not (line:match("^%s*#") or line:match("^%s*$")) then
+      local indent = #(line:match("^(%s*)"))
+      local key = line:match("^%s*([%w%._/%-]+):")
+      if indent == 0 then
+        in_pipelines = key == "pipelines"
+        in_custom = false
+      elseif in_pipelines and not in_custom then
+        if key == "custom" then
+          in_custom, custom_indent = true, indent
+        end
+      elseif in_custom then
+        if indent <= custom_indent then
+          in_custom = false
+        elseif indent == custom_indent + 2 and key then
+          names[#names + 1] = key
+        end
+      end
+    end
+  end
+  return names
+end
+
+-- Run: select a branch (ref) and a pipeline definition, then trigger
+function M.pipeline_run()
+  local function trigger(ref, custom)
+    if not custom or custom == "" then
+      notify("triggering pipeline on " .. ref .. " …")
+      return sh({ config.bkt, "pipeline", "run", "--ref", ref }, cwd(), function(ok, out, err)
+        if not ok then
+          return notify("pipeline run failed: " .. (err ~= "" and err or out), vim.log.levels.ERROR)
+        end
+        notify("pipeline triggered on " .. ref)
+      end)
+    end
+    local ws, slug = remote_ws_slug(cwd())
+    if not (ws and slug) then
+      notify("can't derive workspace/repo — running default pipeline", vim.log.levels.WARN)
+      return trigger(ref, nil)
+    end
+    local body = {
+      target = {
+        ref_type = "branch",
+        type = "pipeline_ref_target",
+        ref_name = ref,
+        selector = { type = "custom", pattern = custom },
+      },
+    }
+    sh({
+      config.bkt,
+      "api",
+      ("/repositories/%s/%s/pipelines/"):format(ws, slug),
+      "--method",
+      "POST",
+      "--input",
+      vim.json.encode(body),
+    }, cwd(), function(ok, out, err)
+      if not ok then
+        return notify("custom pipeline failed: " .. (err ~= "" and err or out), vim.log.levels.ERROR)
+      end
+      notify(("pipeline '%s' triggered on %s"):format(custom, ref))
+    end)
+  end
+
+  local function with_ref(ref)
+    if not ref or ref == "" then
+      return
+    end
+    local customs = custom_pipelines(cwd())
+    if #customs == 0 then
+      return trigger(ref, nil) -- only the default/branch pipeline exists
+    end
+    local DEFAULT = "default (branch/PR pipeline)"
+    local options = { DEFAULT }
+    vim.list_extend(options, customs)
+    select_one(options, { prompt = "Pipeline for " .. ref, label = function(o)
+      return o
+    end }, function(choice)
+      trigger(ref, choice ~= DEFAULT and choice or nil)
+    end)
+  end
+
+  local raw = vim.fn.systemlist({ "git", "-C", cwd(), "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin" })
+  local branches = {}
+  for _, b in ipairs(raw) do
+    local name = b:gsub("^origin/", "")
+    if name ~= "" and name ~= "HEAD" then
+      branches[#branches + 1] = name
+    end
+  end
+  if #branches == 0 then
+    vim.ui.input({ prompt = "Pipeline ref (branch): ", default = "main" }, with_ref)
+  else
+    select_one(branches, { prompt = "Run pipeline on branch", label = function(b)
+      return b
+    end }, with_ref)
+  end
+end
+
 function M.pick(extra)
   local has_extra = extra and #extra > 0
   local args = { "pr", "list" }
@@ -1132,6 +1540,21 @@ function M.setup(opts)
   api.nvim_create_user_command("BktPrRevdiff", function()
     M.export_revdiff()
   end, {})
+  api.nvim_create_user_command("BktPipelines", function()
+    M.pipeline_list()
+  end, {})
+  api.nvim_create_user_command("BktPipelineView", function(o)
+    M.pipeline_view(o.args ~= "" and o.args or nil)
+  end, { nargs = "?" })
+  api.nvim_create_user_command("BktPipelineLast", function()
+    M.pipeline_view_last()
+  end, {})
+  api.nvim_create_user_command("BktPipelineLogs", function(o)
+    M.pipeline_logs(o.args ~= "" and o.args or nil)
+  end, { nargs = "?" })
+  api.nvim_create_user_command("BktPipelineRun", function()
+    M.pipeline_run()
+  end, {})
   api.nvim_create_user_command("BktReviewClean", function()
     M.clean()
   end, {})
@@ -1172,10 +1595,27 @@ function M.setup(opts)
     M.clean()
   end, "clean worktrees")
 
-  -- name the which-key group when available
+  -- pipelines subgroup: <leader>pP…
+  map("Pl", function()
+    M.pipeline_list()
+  end, "pipelines: list")
+  map("Pv", function()
+    M.pipeline_view()
+  end, "pipelines: view")
+  map("PV", function()
+    M.pipeline_view_last()
+  end, "pipelines: view last")
+  map("PL", function()
+    M.pipeline_logs()
+  end, "pipelines: logs → buffer")
+  map("Pr", function()
+    M.pipeline_run()
+  end, "pipelines: run (branch + pipeline)")
+
+  -- name the which-key groups when available
   local okwk, wk = pcall(require, "which-key")
   if okwk and wk.add then
-    pcall(wk.add, { { p, group = "PR review" } })
+    pcall(wk.add, { { p, group = "PR review" }, { p .. "P", group = "Pipelines" } })
   end
 end
 
