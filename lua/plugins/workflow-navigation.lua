@@ -57,6 +57,22 @@ return {
       opts.defaults.mappings.i = opts.defaults.mappings.i or {}
       opts.defaults.mappings.n = opts.defaults.mappings.n or {}
 
+      opts.defaults.layout_strategy = "flex"
+      opts.defaults.layout_config = vim.tbl_deep_extend("force", opts.defaults.layout_config or {}, {
+        flex = {
+          flip_columns = 140,
+        },
+        horizontal = {
+          width = 0.95,
+          height = 0.9,
+          preview_width = 0.55,
+        },
+        vertical = {
+          width = 0.95,
+          height = 0.95,
+          preview_height = 0.6,
+        },
+      })
       opts.defaults.mappings.i["<C-d>"] = actions.delete_buffer
       opts.defaults.mappings.i["<C-e>"] = for_each_file
       opts.defaults.mappings.i["<C-g>"] = grep_in_selected

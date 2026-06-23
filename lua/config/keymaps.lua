@@ -93,6 +93,22 @@ map("n", "<leader>lw", function()
 end, { desc = "Loclist: save named" })
 map("n", "<leader>ls", ll.telescope_switch, { desc = "Loclist: switch" })
 
+-- Copy file name / path to the system clipboard
+local function copy_to_clipboard(value, label)
+  vim.fn.setreg("+", value)
+  vim.notify(label .. ": " .. value)
+end
+
+map("n", "<leader>yn", function()
+  copy_to_clipboard(vim.fn.expand("%:t"), "Copied name")
+end, { desc = "Copy file name" })
+map("n", "<leader>yp", function()
+  copy_to_clipboard(vim.fn.expand("%:."), "Copied path")
+end, { desc = "Copy relative path" })
+map("n", "<leader>yP", function()
+  copy_to_clipboard(vim.fn.expand("%:p"), "Copied path")
+end, { desc = "Copy absolute path" })
+
 map("n", "<leader>oo", "<cmd>Obsidian open<cr>", { desc = "Obsidian: open" })
 map("n", "<leader>oc", "<cmd>Obsidian check<cr>", { desc = "Obsidian: check" })
 map("n", "<leader>ot", "<cmd>Obsidian today<cr>", { desc = "Obsidian: today" })
