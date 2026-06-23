@@ -242,12 +242,11 @@ local function git(root, args)
   return out
 end
 
--- Export annotations.
---   opts.output : when set, write ONLY the annotation blocks (revdiff stdout
---                 format) to this path — used by the launcher session. The full
---                 history file is still written. No clipboard/notify in this mode.
-function M.export(opts)
-  opts = opts or {}
+-- Build export artifacts from the annotation store. Returns nil when empty.
+-- { blocks = {...}, full = {...}, count = N, repo = "name" }
+--   blocks : annotation blocks only (exactly the revdiff stdout format)
+--   full   : header + annotations + raw diff (the revdiff history-file format)
+local function build()
   local paths = {}
   for path, e in pairs(store) do
     if #e.lines > 0 or #e.file_level.texts > 0 then
@@ -255,10 +254,7 @@ function M.export(opts)
     end
   end
   if #paths == 0 then
-    if not opts.output then
-      notify("no annotations to export", vim.log.levels.WARN)
-    end
-    return
+    return nil
   end
   table.sort(paths)
 
@@ -270,7 +266,6 @@ function M.export(opts)
     return (p:gsub("^" .. vim.pesc(root .. "/"), ""))
   end
 
-  -- annotation blocks only (this is exactly the revdiff stdout format)
   local blocks, count = {}, 0
   for _, path in ipairs(paths) do
     local e = store[path]
@@ -293,7 +288,6 @@ function M.export(opts)
     end
   end
 
-  -- full history file: header + annotations + raw diff
   local full = {
     "# Review: " .. os.date("%Y-%m-%d %H:%M:%S"),
     "path: " .. root,
@@ -314,24 +308,82 @@ function M.export(opts)
     vim.list_extend(full, diff)
   end
 
+  return { blocks = blocks, full = full, count = count, repo = repo }
+end
+
+-- Export annotations to revdiff's history file (+ clipboard / notify).
+--   opts.output : write ONLY the annotation blocks (revdiff stdout format) to
+--                 this path — used by the launcher session.
+function M.export(opts)
+  opts = opts or {}
+  local b = build()
+  if not b then
+    if not opts.output then
+      notify("no annotations to export", vim.log.levels.WARN)
+    end
+    return
+  end
+
   -- always persist the full history file (safety net + "locate my review")
   local hist = config.history_dir
     or vim.env.REVDIFF_HISTORY_DIR
     or (vim.fn.expand("~") .. "/.config/revdiff/history")
-  local dir = hist .. "/" .. repo
+  local dir = hist .. "/" .. b.repo
   vim.fn.mkdir(dir, "p")
   local file = dir .. "/" .. os.date("%Y%m%d-%H%M%S") .. ".md"
-  pcall(vim.fn.writefile, full, file)
+  pcall(vim.fn.writefile, b.full, file)
 
   if opts.output then
-    vim.fn.writefile(blocks, opts.output)
+    vim.fn.writefile(b.blocks, opts.output)
   else
-    pcall(vim.fn.setreg, "+", table.concat(full, "\n"))
+    pcall(vim.fn.setreg, "+", table.concat(b.full, "\n"))
     notify(
       ('exported %d annotation(s) -> %s\nCopied to clipboard. In Claude Code: "use my latest revdiff annotations"')
-        :format(count, file)
+        :format(b.count, file)
     )
   end
+end
+
+-- Show the revdiff-format export in a scratch buffer (no file written).
+--   opts.dest        : "float" (default) | "vsplit" | "split" | "tab"
+--   opts.blocks_only : show annotation blocks only (omit header + diff)
+function M.show(opts)
+  opts = opts or {}
+  local b = build()
+  if not b then
+    return notify("no annotations to show", vim.log.levels.WARN)
+  end
+  local lines = opts.blocks_only and b.blocks or b.full
+
+  local buf = api.nvim_create_buf(false, true)
+  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = "markdown"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = false
+
+  local dest = opts.dest or "float"
+  if dest == "float" then
+    local width = math.min(100, math.max(60, math.floor(vim.o.columns * 0.8)))
+    local height = math.max(5, math.min(#lines + 2, math.floor(vim.o.lines * 0.8)))
+    local win = api.nvim_open_win(buf, true, {
+      relative = "editor",
+      width = width,
+      height = height,
+      row = math.floor((vim.o.lines - height) / 2),
+      col = math.floor((vim.o.columns - width) / 2),
+      style = "minimal",
+      border = "rounded",
+      title = " revdiff export (" .. b.count .. " annotations) — q to close ",
+      title_pos = "center",
+    })
+    vim.wo[win].wrap = false
+    vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, desc = "Close" })
+    vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", { buffer = buf, desc = "Close" })
+  else
+    vim.cmd(dest == "tab" and "tabnew" or dest == "split" and "split" or "vsplit")
+    api.nvim_win_set_buf(0, buf)
+  end
+  return buf
 end
 
 -- Launcher session: auto-export on quit to opts.output; optionally diff against base.
@@ -377,6 +429,18 @@ local function register()
   cmd("RevdiffExport", function()
     M.export()
   end)
+  cmd("RevdiffShow", function(o)
+    if o.args == "blocks" then
+      M.show({ blocks_only = true })
+    else
+      M.show({ dest = (o.args ~= "" and o.args) or "float" })
+    end
+  end, {
+    nargs = "?",
+    complete = function()
+      return { "float", "vsplit", "split", "tab", "blocks" }
+    end,
+  })
   cmd("RevdiffClear", M.clear)
 
   local p = config.prefix
@@ -390,6 +454,7 @@ local function register()
   map("n", p .. "d", "<cmd>RevdiffDelete<cr>", "Review: delete comment")
   map("n", p .. "l", "<cmd>RevdiffList<cr>", "Review: list comments")
   map("n", p .. "e", "<cmd>RevdiffExport<cr>", "Review: export to revdiff history")
+  map("n", p .. "s", "<cmd>RevdiffShow<cr>", "Review: show export (float)")
   map("n", p .. "x", "<cmd>RevdiffClear<cr>", "Review: clear all")
 end
 
