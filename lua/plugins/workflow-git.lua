@@ -30,7 +30,29 @@ return {
         desc = "Line history",
       },
     },
-    opts = {},
+    config = function()
+      local function diffview_opts()
+        -- Characters are ~2x taller than wide, so on a portrait screen cols/lines < 2
+        local portrait = vim.o.columns < vim.o.lines * 2
+        local layout = portrait and "diff2_vertical" or "diff2_horizontal"
+        return {
+          view = {
+            default = { layout = layout },
+            file_history = { layout = layout },
+            merge_tool = {
+              layout = portrait and "diff3_vertical" or "diff3_horizontal",
+              winbar_info = true,
+            },
+          },
+        }
+      end
+      require("diffview").setup(diffview_opts())
+      vim.api.nvim_create_autocmd("VimResized", {
+        callback = function()
+          require("diffview").setup(diffview_opts())
+        end,
+      })
+    end,
   },
   {
     "ThePrimeagen/harpoon",
