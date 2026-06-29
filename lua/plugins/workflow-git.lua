@@ -101,47 +101,77 @@ return {
   },
   {
     "lewis6991/gitsigns.nvim",
-    opts = {
-      signs = {
+    opts = function(_, opts)
+      opts = opts or {}
+      opts.signs = {
         add = { text = "+" },
         change = { text = "~" },
         delete = { text = "_" },
         topdelete = { text = "‾" },
         changedelete = { text = "~" },
-      },
-      signs_staged_enable = true,
-      signcolumn = true, -- Toggle with `:Gitsigns toggle_signs`
-      numhl = false, -- Toggle with `:Gitsigns toggle_numhl`
-      linehl = false, -- Toggle with `:Gitsigns toggle_linehl`
-      word_diff = false, -- Toggle with `:Gitsigns toggle_word_diff`
-      watch_gitdir = {
+      }
+      opts.signs_staged_enable = true
+      opts.signcolumn = true -- Toggle with `:Gitsigns toggle_signs`
+      opts.numhl = false -- Toggle with `:Gitsigns toggle_numhl`
+      opts.linehl = false -- Toggle with `:Gitsigns toggle_linehl`
+      opts.word_diff = false -- Toggle with `:Gitsigns toggle_word_diff`
+      opts.watch_gitdir = {
         follow_files = true,
-      },
-      auto_attach = true,
-      attach_to_untracked = false,
-      current_line_blame = true, -- Toggle with `:Gitsigns toggle_current_line_blame`
-      current_line_blame_opts = {
+      }
+      opts.auto_attach = true
+      opts.attach_to_untracked = false
+      opts.current_line_blame = true -- Toggle with `:Gitsigns toggle_current_line_blame`
+      opts.current_line_blame_opts = {
         virt_text = true,
         virt_text_pos = "eol", -- 'eol' | 'overlay' | 'right_align'
         delay = 1000,
         ignore_whitespace = false,
         virt_text_priority = 100,
         use_focus = true,
-      },
-      current_line_blame_formatter = "<author>, <author_time:%Y-%m-%d> - <summary> (<abbrev_sha>)",
-      sign_priority = 6,
-      update_debounce = 100,
-      status_formatter = nil, -- Use default
-      max_file_length = 40000, -- Disable if file is longer than this (in lines)
-      preview_config = {
+      }
+      opts.current_line_blame_formatter = "<author>, <author_time:%Y-%m-%d> - <summary> (<abbrev_sha>)"
+      opts.sign_priority = 6
+      opts.update_debounce = 100
+      opts.status_formatter = nil -- Use default
+      opts.max_file_length = 40000 -- Disable if file is longer than this (in lines)
+      opts.preview_config = {
         -- Options passed to nvim_open_win
         border = "single",
         style = "minimal",
         relative = "cursor",
         row = 0,
         col = 1,
-      },
-    },
+      }
+
+      local old_on_attach = opts.on_attach
+      opts.on_attach = function(buffer)
+        if old_on_attach then
+          old_on_attach(buffer)
+        end
+
+        local gs = package.loaded.gitsigns
+        local function map(lhs, direction, desc)
+          vim.keymap.set("n", lhs, function()
+            if vim.wo.diff then
+              vim.cmd.normal({ direction == "next" and "]c" or "[c", bang = true })
+            else
+              gs.nav_hunk(direction, { target = "all" })
+            end
+          end, { buffer = buffer, desc = desc, silent = true })
+        end
+
+        map("]h", "next", "Next Hunk")
+        map("[h", "prev", "Prev Hunk")
+        vim.keymap.set("n", "]H", function()
+          gs.nav_hunk("last", { target = "all" })
+        end, { buffer = buffer, desc = "Last Hunk", silent = true })
+        vim.keymap.set("n", "[H", function()
+          gs.nav_hunk("first", { target = "all" })
+        end, { buffer = buffer, desc = "First Hunk", silent = true })
+      end
+
+      return opts
+    end,
   },
   {
     "gcmt/vessel.nvim",
