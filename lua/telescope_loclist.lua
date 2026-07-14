@@ -2,6 +2,7 @@ local M = {}
 
 local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
+local loclist_context = require("loclist_context")
 
 local function entry_to_locitem(entry)
   local value = type(entry.value) == "table" and entry.value or {}
@@ -18,13 +19,13 @@ local function entry_to_locitem(entry)
     return nil
   end
 
-  return {
+  return loclist_context.extend_item({
     bufnr = entry.bufnr,
     filename = filename,
     lnum = lnum,
     col = col,
     text = type(text) == "string" and text or vim.inspect(text),
-  }
+  })
 end
 
 local function set_picker_loclist(prompt_bufnr, entries)
@@ -46,8 +47,9 @@ local function set_picker_loclist(prompt_bufnr, entries)
   local title = string.format("%s (%s)", picker.prompt_title, picker:_get_prompt())
   actions.close(prompt_bufnr)
   vim.fn.setloclist(picker.original_win_id, {}, "r", {
-    title = title,
     items = items,
+    quickfixtextfunc = loclist_context.quickfixtextfunc,
+    title = title,
   })
 end
 

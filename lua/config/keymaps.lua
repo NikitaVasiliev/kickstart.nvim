@@ -6,6 +6,37 @@ local map = vim.keymap.set
 
 pcall(vim.keymap.del, "n", "<leader>l")
 
+local function stop_lsp_for_buffer(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local clients = vim.lsp.get_clients({ bufnr = bufnr })
+  if #clients == 0 then
+    vim.notify("No LSP clients attached to buffer " .. bufnr, vim.log.levels.INFO)
+    return
+  end
+
+  vim.lsp.stop_client(clients)
+  vim.notify("Stopped " .. #clients .. " LSP client(s) for buffer " .. bufnr, vim.log.levels.INFO)
+end
+
+vim.api.nvim_create_user_command("LspStopBuffer", function()
+  stop_lsp_for_buffer(0)
+end, { desc = "Stop LSP clients attached to the current buffer" })
+
+vim.api.nvim_create_user_command("LspStopWindow", function()
+  stop_lsp_for_buffer(vim.api.nvim_win_get_buf(0))
+end, { desc = "Stop LSP clients attached to the current window's buffer" })
+
+vim.api.nvim_create_user_command("LspStopTab", function()
+  local seen = {}
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local bufnr = vim.api.nvim_win_get_buf(win)
+    if not seen[bufnr] then
+      seen[bufnr] = true
+      stop_lsp_for_buffer(bufnr)
+    end
+  end
+end, { desc = "Stop LSP clients attached to buffers visible in the current tab" })
+
 map("n", "<leader>ft", function()
   require("telescope").extensions.tab_switch.tabs()
 end, { desc = "Telescope: switch tabs" })
@@ -60,31 +91,122 @@ map({ "n", "v" }, "<leader>dtr", function()
   require("translate").translate({ lang = ":ru" })
 end, { desc = "Translate to :ru" })
 
-map("n", "<leader>ld", function()
-  local win = 0
-  local loclist = vim.fn.getloclist(win)
+local function current_window_is_loclist()
+  local wininfo = vim.fn.getwininfo(vim.api.nvim_get_current_win())[1]
+  return wininfo and wininfo.quickfix == 1 and wininfo.loclist == 1
+end
+
+local loclist_undo = {}
+
+local function get_loclist_context()
+  local current_win = vim.api.nvim_get_current_win()
+  local in_loclist_win = current_window_is_loclist()
+  local locinfo = vim.fn.getloclist(current_win, { filewinid = 0, id = 0, idx = 0, items = 0, title = 0 })
+  local loclist_win = locinfo.filewinid ~= 0 and locinfo.filewinid or current_win
+  local key = locinfo.id ~= 0 and locinfo.id or loclist_win
+
+  return {
+    current_win = current_win,
+    in_loclist_win = in_loclist_win,
+    locinfo = locinfo,
+    loclist_win = loclist_win,
+    key = key,
+  }
+end
+
+local function push_loclist_undo(context, cursor_idx)
+  local stack = loclist_undo[context.key] or {}
+  loclist_undo[context.key] = stack
+
+  table.insert(stack, {
+    cursor_idx = cursor_idx,
+    idx = context.locinfo.idx,
+    items = vim.deepcopy(context.locinfo.items or {}),
+    title = context.locinfo.title,
+  })
+end
+
+local function delete_current_loclist_entry()
+  local context = get_loclist_context()
+  local loclist = context.locinfo.items or {}
+
   if #loclist == 0 then
     return
   end
 
-  local idx = vim.fn.getloclist(win, { idx = 0 }).idx
+  local idx = context.in_loclist_win and vim.fn.line(".") or context.locinfo.idx
   if not idx or idx < 1 or idx > #loclist then
     return
   end
 
+  push_loclist_undo(context, idx)
   table.remove(loclist, idx)
-  vim.fn.setloclist(win, {}, "r", { items = loclist })
 
-  if #loclist == 0 then
+  if #loclist == 0 and not context.in_loclist_win then
     vim.cmd("lclose")
-  elseif idx > #loclist then
-    vim.cmd("llast")
   else
-    vim.cmd("lnext")
-  end
-end, { desc = "Loclist: delete current entry" })
+    local next_idx = math.min(idx, #loclist)
+    vim.fn.setloclist(context.loclist_win, {}, "r", {
+      idx = next_idx,
+      items = loclist,
+      quickfixtextfunc = require("loclist_context").quickfixtextfunc,
+      title = context.locinfo.title,
+    })
 
-map("n", "<leader>lo", "<cmd>lopen<cr>", { desc = "Loclist: open" })
+    if context.in_loclist_win and next_idx > 0 and vim.api.nvim_win_is_valid(context.current_win) then
+      vim.api.nvim_win_set_cursor(context.current_win, { next_idx, 0 })
+    end
+  end
+end
+
+local function undo_loclist_delete()
+  local context = get_loclist_context()
+  local stack = loclist_undo[context.key]
+  local previous = stack and table.remove(stack)
+
+  if not previous then
+    return
+  end
+
+  vim.fn.setloclist(context.loclist_win, {}, "r", {
+    idx = previous.idx,
+    items = previous.items,
+    quickfixtextfunc = require("loclist_context").quickfixtextfunc,
+    title = previous.title,
+  })
+
+  if context.in_loclist_win and vim.api.nvim_win_is_valid(context.current_win) then
+    vim.api.nvim_win_set_cursor(context.current_win, { math.min(previous.cursor_idx, #previous.items), 0 })
+  end
+end
+
+local function open_current_loclist()
+  local context = get_loclist_context()
+  require("loclist_context").refresh(context.loclist_win, { load = true })
+  vim.cmd("lopen")
+end
+
+map("n", "<leader>ld", delete_current_loclist_entry, { desc = "Loclist: delete current entry" })
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "qf",
+  callback = function(event)
+    if not current_window_is_loclist() then
+      return
+    end
+
+    map("n", "dd", delete_current_loclist_entry, {
+      buffer = event.buf,
+      desc = "Loclist: delete current entry",
+    })
+    map("n", "u", undo_loclist_delete, {
+      buffer = event.buf,
+      desc = "Loclist: undo delete",
+    })
+  end,
+})
+
+map("n", "<leader>lo", open_current_loclist, { desc = "Loclist: open" })
 map("n", "<leader>lc", "<cmd>lclose<cr>", { desc = "Loclist: close" })
 
 local ll = require("named_loclist")

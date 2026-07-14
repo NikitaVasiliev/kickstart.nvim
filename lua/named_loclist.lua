@@ -1,16 +1,20 @@
 _G.NamedLoclists = _G.NamedLoclists or {}
 
 local M = {}
+local loclist_context = require("loclist_context")
 
 function M.add_current()
-  local item = {
+  local item = loclist_context.extend_item({
     bufnr = vim.api.nvim_get_current_buf(),
     lnum = vim.fn.line("."),
     col = vim.fn.col("."),
     text = vim.fn.getline("."),
-  }
+  })
 
-  vim.fn.setloclist(0, {}, "a", { items = { item } })
+  vim.fn.setloclist(0, {}, "a", {
+    items = { item },
+    quickfixtextfunc = loclist_context.quickfixtextfunc,
+  })
 end
 
 function M.save(name)
@@ -41,6 +45,7 @@ function M.restore(name)
 
   vim.fn.setloclist(0, {}, "r", {
     items = saved.items,
+    quickfixtextfunc = loclist_context.quickfixtextfunc,
     title = saved.title,
   })
 
