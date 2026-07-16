@@ -21,6 +21,8 @@ local config = {
   prefix = "<leader>p", -- PR review group
   bkt = "bkt",
   worktree_dir = vim.fn.stdpath("cache") .. "/bkt-review",
+  list_page_size = 20, -- PRs per page in the picker; ] / [ page through (Cloud pagelen, capped at 50)
+  list_limit = 0, -- fetch-all fallback only (--mine / non-Cloud): 0 = all, 1..50 = single page
 }
 
 -- active review session: { id, src, dst, root, repo, ws, slug, wt, threads = {byid,roots}, by_path = {path -> {threads}} }
@@ -1522,11 +1524,241 @@ function M.pipeline_run()
   end
 end
 
+local function pr_label(p)
+  local author = dig(p, "author", "display_name") or dig(p, "author", "nickname") or dig(p, "author", "name") or "?"
+  return ("#%s  [%s]  %s  — %s"):format(first(p.id, p.number), first(p.state, "?"), first(p.title, "?"), author)
+end
+
+-- Telescope picker over the PR list, paged config.list_page_size at a time.
+-- ] / [ move to the next / previous page (insert & normal mode).
+local function pr_picker(list, on_choice)
+  if not pcall(require, "telescope") then
+    return vim.ui.select(list, { prompt = "Bitbucket PR", format_item = pr_label }, function(choice)
+      if choice then
+        on_choice(choice)
+      end
+    end)
+  end
+  local pickers = require("telescope.pickers")
+  local finders = require("telescope.finders")
+  local conf = require("telescope.config").values
+  local actions = require("telescope.actions")
+  local astate = require("telescope.actions.state")
+
+  local size = math.max(1, config.list_page_size or 20)
+  local pages = math.max(1, math.ceil(#list / size))
+  local page = 0
+
+  local function entry_maker(p)
+    local disp = pr_label(p)
+    return { value = p, display = disp, ordinal = disp }
+  end
+  local function page_finder()
+    local rows, from = {}, page * size
+    for i = from + 1, math.min(from + size, #list) do
+      rows[#rows + 1] = list[i]
+    end
+    return finders.new_table({ results = rows, entry_maker = entry_maker })
+  end
+  local function title()
+    if pages == 1 then
+      return ("Bitbucket PR (%d)"):format(#list)
+    end
+    return ("Bitbucket PR — page %d/%d (%d total, ] / [)"):format(page + 1, pages, #list)
+  end
+
+  local picker
+  local function turn(delta)
+    local np = page + delta
+    if np < 0 or np >= pages then
+      return
+    end
+    page = np
+    picker:refresh(page_finder(), { reset_prompt = true })
+    pcall(function()
+      picker.layout.prompt.border:change_title(title())
+    end)
+  end
+
+  picker = pickers.new({}, {
+    prompt_title = title(),
+    finder = page_finder(),
+    sorter = conf.generic_sorter({}),
+    attach_mappings = function(bufnr, map)
+      actions.select_default:replace(function()
+        actions.close(bufnr)
+        local e = astate.get_selected_entry()
+        if e then
+          on_choice(e.value)
+        end
+      end)
+      map({ "i", "n" }, "]", function()
+        turn(1)
+      end)
+      map({ "i", "n" }, "[", function()
+        turn(-1)
+      end)
+      return true
+    end,
+  })
+  picker:find()
+end
+
+-- Lazily-paged Telescope picker. loader(page, cb) fetches ONE page from the
+-- server and calls cb(rows, total_count, has_next). Fetched pages are cached so
+-- [ back is instant; ] fetches the next page only when first visited.
+local function pr_picker_lazy(loader, page_size, on_choice)
+  if not pcall(require, "telescope") then
+    return loader(1, function(rows)
+      vim.ui.select(rows or {}, { prompt = "Bitbucket PR", format_item = pr_label }, function(c)
+        if c then
+          on_choice(c)
+        end
+      end)
+    end)
+  end
+  local pickers = require("telescope.pickers")
+  local finders = require("telescope.finders")
+  local conf = require("telescope.config").values
+  local actions = require("telescope.actions")
+  local astate = require("telescope.actions.state")
+
+  -- last_page is the authoritative upper bound, learned from the `next` field
+  -- (or an empty page). total_count is only a hint for the title: Bitbucket's
+  -- `size` over-counts, so it must NOT gate navigation.
+  local page, last_page, total_count = 1, nil, nil
+  local cache, loading, picker, pbufnr = {}, false, nil, nil
+
+  local function entry_maker(p)
+    local disp = pr_label(p)
+    return { value = p, display = disp, ordinal = disp }
+  end
+  local function set_title(t)
+    pcall(function()
+      picker.layout.prompt.border:change_title(t)
+    end)
+  end
+  local function title()
+    local of = last_page and ("/" .. last_page) or "+"
+    local tot = total_count and (" · %d total"):format(total_count) or ""
+    return ("Bitbucket PR — page %d%s%s (] / [)"):format(page, of, tot)
+  end
+  local function show(rows)
+    picker:refresh(finders.new_table({ results = rows, entry_maker = entry_maker }), { reset_prompt = true })
+    set_title(title())
+  end
+  local function go(p)
+    if loading or p < 1 or (last_page and p > last_page) then
+      return
+    end
+    if cache[p] then
+      page = p
+      return show(cache[p])
+    end
+    loading = true
+    set_title(("Bitbucket PR — loading page %d…"):format(p))
+    loader(p, function(rows, total, has_next)
+      loading = false
+      if not rows then
+        return set_title(title()) -- fetch failed: keep showing the current page
+      end
+      if total then
+        total_count = total
+      end
+      if #rows == 0 then
+        -- `size` promised more, but this page is empty → the real end is p-1.
+        last_page = math.max(1, p - 1)
+        if p == 1 then
+          if pbufnr then
+            pcall(actions.close, pbufnr)
+          end
+          return notify("no PRs for this scope — try :BktPr --mine")
+        end
+        set_title(title())
+        return notify("no more PRs")
+      end
+      if not has_next then
+        last_page = p -- authoritative last page
+      end
+      cache[p] = rows
+      page = p
+      show(rows)
+    end)
+  end
+
+  picker = pickers.new({}, {
+    prompt_title = "Bitbucket PR — loading…",
+    -- Force top-anchored results. Telescope's default "descending" strategy
+    -- positions the results cursor at `max_results - window_height`, which is
+    -- out of range when a page has fewer rows than the window is tall; that
+    -- throws inside the finder-completion callback and leaves the list blank.
+    sorting_strategy = "ascending",
+    finder = finders.new_table({ results = {}, entry_maker = entry_maker }),
+    sorter = conf.generic_sorter({}),
+    attach_mappings = function(bufnr, map)
+      pbufnr = bufnr
+      actions.select_default:replace(function()
+        actions.close(bufnr)
+        local e = astate.get_selected_entry()
+        if e then
+          on_choice(e.value)
+        end
+      end)
+      map({ "i", "n" }, "]", function()
+        go(page + 1)
+      end)
+      map({ "i", "n" }, "[", function()
+        go(page - 1)
+      end)
+      return true
+    end,
+  })
+  picker:find()
+  go(1)
+end
+
 function M.pick(extra)
   local has_extra = extra and #extra > 0
+  -- Bitbucket Cloud (repo remote resolvable) → lazy server-side pagination via
+  -- the REST endpoint, which supports page/pagelen. --mine / --repo / explicit
+  -- --limit and non-Cloud remotes fall through to the fetch-all path below.
+  local state, forced = "OPEN", false
+  if has_extra then
+    for i, a in ipairs(extra) do
+      if a == "--state" and extra[i + 1] then
+        state = tostring(extra[i + 1]):upper()
+      elseif a == "--mine" or a == "--repo" or a == "--workspace" or a == "--project" or a == "--limit" then
+        forced = true
+      end
+    end
+  end
+  local ws, slug = remote_ws_slug(cwd())
+  if ws and slug and not forced then
+    local size = math.min(50, math.max(1, config.list_page_size or 20)) -- Cloud caps pagelen at 50
+    local path = ("/repositories/%s/%s/pullrequests"):format(ws, slug)
+    local dir = cwd()
+    local function loader(pageno, cb)
+      bkt_json({ "api", path, "--param", "state=" .. state, "--param", "pagelen=" .. size, "--param", "page=" .. pageno }, dir, function(d, err)
+        if not d then
+          notify("list failed: " .. err, vim.log.levels.ERROR)
+          return cb(nil)
+        end
+        -- `next` is authoritative for "more pages exist"; `size` over-counts.
+        cb(as_list(d) or {}, tonumber(d.size), val(d.next) ~= nil)
+      end)
+    end
+    return pr_picker_lazy(loader, size, function(choice)
+      M.review(choice)
+    end)
+  end
+
   local args = { "pr", "list" }
   if has_extra then
     vim.list_extend(args, extra)
+  end
+  -- bkt defaults to --limit 20; fetch the full set unless the caller set one
+  if not (has_extra and vim.tbl_contains(extra, "--limit")) then
+    vim.list_extend(args, { "--limit", tostring(config.list_limit) })
   end
   local function run(a, may_retry)
     bkt_json(a, cwd(), function(prs, err)
@@ -1541,16 +1773,8 @@ function M.pick(extra)
       if not list or #list == 0 then
         return notify("no PRs for this scope — try :BktPr --mine")
       end
-      vim.ui.select(list, {
-        prompt = "Bitbucket PR",
-        format_item = function(p)
-          local author = dig(p, "author", "display_name") or dig(p, "author", "nickname") or dig(p, "author", "name") or "?"
-          return ("#%s  [%s]  %s  — %s"):format(first(p.id, p.number), first(p.state, "?"), first(p.title, "?"), author)
-        end,
-      }, function(choice)
-        if choice then
-          M.review(choice)
-        end
+      pr_picker(list, function(choice)
+        M.review(choice)
       end)
     end)
   end
