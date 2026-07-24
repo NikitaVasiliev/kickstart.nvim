@@ -31,6 +31,22 @@ return {
       },
     },
     config = function()
+      local function focus_diff_side(side)
+        local ok, lib = pcall(require, "diffview.lib")
+        local view = ok and lib.get_current_view()
+        local win = view and view.cur_layout and view.cur_layout[side]
+
+        if not win or not win.id or not vim.api.nvim_win_is_valid(win.id) then
+          return
+        end
+
+        vim.api.nvim_set_current_win(win.id)
+        -- Keep the other revision alive for an instant switch back, while
+        -- giving the selected revision all of the available split space.
+        vim.cmd("wincmd |")
+        vim.cmd("wincmd _")
+      end
+
       local function diffview_opts()
         -- Characters are ~2x taller than wide, so on a portrait screen cols/lines < 2
         local portrait = vim.o.columns < vim.o.lines * 2
@@ -42,6 +58,12 @@ return {
             merge_tool = {
               layout = portrait and "diff3_vertical" or "diff3_horizontal",
               winbar_info = true,
+            },
+          },
+          keymaps = {
+            view = {
+              { "n", "[o", function() focus_diff_side("a") end, { desc = "Show old revision" } },
+              { "n", "]o", function() focus_diff_side("b") end, { desc = "Show new revision" } },
             },
           },
         }
