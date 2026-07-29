@@ -31,6 +31,10 @@ return {
       },
     },
     config = function()
+      local function toggle_checked_file()
+        require("diffview_checked").toggle()
+      end
+
       local function focus_diff_side(side)
         local ok, lib = pcall(require, "diffview.lib")
         local view = ok and lib.get_current_view()
@@ -64,11 +68,19 @@ return {
             view = {
               { "n", "[o", function() focus_diff_side("a") end, { desc = "Show old revision" } },
               { "n", "]o", function() focus_diff_side("b") end, { desc = "Show new revision" } },
+              { "n", "<leader>Gk", toggle_checked_file, { desc = "Toggle file checked" } },
+            },
+            file_panel = {
+              { "n", "<leader>Gk", toggle_checked_file, { desc = "Toggle file checked" } },
+            },
+            file_history_panel = {
+              { "n", "<leader>Gk", toggle_checked_file, { desc = "Toggle file checked" } },
             },
           },
         }
       end
       require("diffview").setup(diffview_opts())
+      require("diffview_checked").setup()
       vim.api.nvim_create_autocmd("VimResized", {
         callback = function()
           require("diffview").setup(diffview_opts())
