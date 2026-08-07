@@ -248,6 +248,33 @@ table.insert(steps, function(next_step)
   end)
 end)
 
+-- The picker shows one stack per page: rows are the frames of a single path,
+-- so j/k walks the stack and ] / [ switch stacks.
+table.insert(steps, function(next_step)
+  at("leaf", 4, function(paths)
+    if not paths then
+      return next_step()
+    end
+    local p = paths[1]
+    local rows = I.frames_of(p)
+    check("a page holds one stack's frames, not the list of stacks", #rows == #p.frames, ("%d vs %d"):format(#rows, #p.frames))
+    check("frames are numbered gdb-style, #0 innermost", rows[1].idx == 0 and rows[1].name == p.frames[1].name, vim.inspect({ rows[1].idx, rows[1].name }))
+    check("the last frame is the outermost", rows[#rows].idx == #rows - 1, rows[#rows].idx)
+    check("frame #0 has nothing below it", rows[1].below == nil, tostring(rows[1].below))
+    check("later frames name the frame they call", rows[2] and rows[2].below == p.frames[1].name, tostring(rows[2] and rows[2].below))
+
+    -- Every row must be jumpable, i.e. carry a resolvable file and line.
+    local bad = 0
+    for _, r in ipairs(rows) do
+      if not r.uri or not (r.call_lnum or r.lnum) then
+        bad = bad + 1
+      end
+    end
+    check("every frame row is jumpable", bad == 0, bad)
+    next_step()
+  end)
+end)
+
 -- Runs last: it lowers max_paths for the rest of the process.
 table.insert(steps, function(next_step)
   I.set_config({ max_paths = 2 })

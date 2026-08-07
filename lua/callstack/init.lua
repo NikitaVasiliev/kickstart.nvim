@@ -292,6 +292,22 @@ end
 -- picker
 --------------------------------------------------------------------------------
 
+-- Frames of one path as picker rows: gdb-style index (#0 innermost) plus the
+-- name of the frame below, so a row can say "calls X" on its own.
+local function frames_of(path)
+  local out = {}
+  for i, f in ipairs(path.frames) do
+    table.insert(
+      out,
+      vim.tbl_extend("keep", {
+        idx = i - 1,
+        below = i > 1 and path.frames[i - 1].name or nil,
+      }, f)
+    )
+  end
+  return out
+end
+
 local function fallback_select(paths, on_pick)
   vim.ui.select(paths, {
     prompt = "Call paths",
@@ -303,8 +319,10 @@ local function fallback_select(paths, on_pick)
   end)
 end
 
--- Paged in-memory picker, modelled on bkt_review's pr_picker_lazy so ] / [
--- mean the same thing here as they do under <leader>p.
+-- One stack per page.  The rows are the *frames* of a single call path, so j/k
+-- walks the stack and the preview follows; ] / [ switch to the next stack, the
+-- way <leader>p] steps comments.  Frames are numbered gdb-style, #0 innermost,
+-- which makes the direction unambiguous and matches the loclist order.
 local function show(state)
   local ok = pcall(require, "telescope")
   if not ok then
@@ -317,152 +335,124 @@ local function show(state)
   local pickers = require("telescope.pickers")
   local finders = require("telescope.finders")
   local conf = require("telescope.config").values
-  local previewers = require("telescope.previewers")
-  local putils = require("telescope.previewers.utils")
+  local actions = require("telescope.actions")
   local action_state = require("telescope.actions.state")
+  local entry_display = require("telescope.pickers.entry_display")
   local telescope_loclist = require("telescope_loclist")
 
-  local page_size = math.max(1, config.page_size)
-  local pages = math.max(1, math.ceil(#state.paths / page_size))
-  state.page = math.min(state.page or 1, pages)
-  -- Which frame of the selected path the preview shows.  Defaults to the
-  -- outermost, which is the entry point you were hunting for.
-  state.focus = nil
+  state.index = math.min(math.max(state.index or 1, 1), #state.paths)
 
   local picker
 
-  local function slice()
-    local first = (state.page - 1) * page_size + 1
-    local rows = {}
-    for i = first, math.min(first + page_size - 1, #state.paths) do
-      table.insert(rows, state.paths[i])
+  local function current()
+    return state.paths[state.index]
+  end
+
+  local displayer = entry_display.create({
+    separator = "  ",
+    items = {
+      { width = 4 },  -- #n
+      { width = 28 }, -- symbol
+      { width = 22 }, -- file:line
+      { remaining = true },
+    },
+  })
+
+  local function entry_maker(frame)
+    local lnum = frame.call_lnum or frame.lnum
+    local rel = ("%s:%d"):format(frame.file, lnum)
+    local note = ""
+    if frame.below then
+      note = (frame.indirect and "takes address of " or "calls ") .. frame.below
     end
-    return rows
+    return {
+      value = frame,
+      filename = vim.uri_to_fname(frame.uri),
+      lnum = lnum,
+      col = frame.call_col or frame.col,
+      ordinal = frame.name .. " " .. rel,
+      display = function()
+        return displayer({
+          { "#" .. tostring(frame.idx), "TelescopeResultsNumber" },
+          { frame.name, frame.indirect and "DiagnosticWarn" or "TelescopeResultsIdentifier" },
+          { rel, "TelescopeResultsComment" },
+          { note, frame.indirect and "DiagnosticWarn" or "TelescopeResultsComment" },
+        })
+      end,
+    }
+  end
+
+  local function rows()
+    return frames_of(current())
   end
 
   local function title()
-    local t = ("Callers of %s — depth %d — page %d/%d · %d path%s"):format(
-      state.root_name,
-      state.depth,
-      state.page,
-      pages,
-      #state.paths,
-      #state.paths == 1 and "" or "s"
-    )
+    local p = current()
+    local t = ("stack %d/%d — depth %d — %s"):format(state.index, #state.paths, state.depth, path_label(p))
     if state.truncated then
       t = t .. " · TRUNCATED"
     end
-    return t .. " (] / [)"
+    return t
   end
 
+  -- picker.layout is only populated once the picker is drawn, and older
+  -- telescope exposes prompt_border instead; try both and shrug if neither.
   local function set_title(t)
-    pcall(function()
+    if pcall(function()
       picker.layout.prompt.border:change_title(t)
+    end) then
+      return
+    end
+    pcall(function()
+      picker.prompt_border:change_title(t)
     end)
   end
 
-  local function entry_maker(p)
-    local disp = path_label(p)
-    return { value = p, display = disp, ordinal = disp }
-  end
-
-  local function focused_frame(p)
-    local n = #p.frames
-    local idx = state.focus or n
-    if idx < 1 or idx > n then
-      idx = n
+  local function go(i)
+    if i < 1 or i > #state.paths then
+      return
     end
-    return p.frames[idx], idx, n
-  end
-
-  local preview = previewers.new_buffer_previewer({
-    title = "Frame",
-    define_preview = function(self, entry)
-      local f, idx, n = focused_frame(entry.value)
-      local path = vim.uri_to_fname(f.uri)
-      local lnum = f.call_lnum or f.lnum
-      conf.buffer_previewer_maker(path, self.state.bufnr, {
-        bufname = self.state.bufname,
-        winid = self.state.winid,
-        callback = function(bufnr)
-          pcall(putils.jump_to_line, self, bufnr, lnum)
-        end,
-      })
-      pcall(function()
-        self.state.winid = self.state.winid
-        local t = ("%s  %s:%d  [frame %d/%d — <Tab> to cycle]"):format(f.name, f.file, lnum, idx, n)
-        self.state.title = t
-        if self.state.border and self.state.border.change_title then
-          self.state.border:change_title(t)
-        end
-      end)
-    end,
-  })
-
-  local function refresh(reset_prompt)
-    picker:refresh(finders.new_table({ results = slice(), entry_maker = entry_maker }), {
-      reset_prompt = reset_prompt ~= false,
-    })
+    state.index = i
+    picker:refresh(finders.new_table({ results = rows(), entry_maker = entry_maker }), { reset_prompt = true })
     set_title(title())
   end
+  -- Exposed on the state so the test can exercise paging directly: telescope's
+  -- prompt does not respond to nvim_feedkeys under --headless.
+  state.go = go
 
   picker = pickers.new({}, {
     prompt_title = title(),
-    finder = finders.new_table({ results = slice(), entry_maker = entry_maker }),
+    finder = finders.new_table({ results = rows(), entry_maker = entry_maker }),
     sorter = conf.generic_sorter({}),
-    previewer = preview,
+    previewer = conf.qflist_previewer({}),
     attach_mappings = function(bufnr, map)
-      local actions = require("telescope.actions")
-
-      -- Selecting a path fills the loclist but leaves the picker up, so
-      -- several alternatives can be compared before committing.
-      local function pick()
-        local entry = action_state.get_selected_entry()
-        if not entry then
-          return
-        end
-        path_to_loclist(entry.value, state.win)
-        notify(("loclist: %s"):format(path_label(entry.value)))
-      end
-      map({ "i", "n" }, "<CR>", pick)
-
+      -- ] / [ page between stacks; j/k is left alone so it does what it always
+      -- does inside a picker, which is walk the rows -- here, the frames.
       map({ "i", "n" }, "]", function()
-        if state.page < pages then
-          state.page = state.page + 1
-          refresh()
-        end
+        go(state.index + 1)
       end)
       map({ "i", "n" }, "[", function()
-        if state.page > 1 then
-          state.page = state.page - 1
-          refresh()
-        end
+        go(state.index - 1)
       end)
 
-      -- Cycle which frame the preview shows.
-      map({ "i", "n" }, "<Tab>", function()
+      -- Whole stack -> loclist, positioned on the frame that was selected, and
+      -- the picker stays open so other stacks can be compared.
+      local function send()
+        local p = current()
         local entry = action_state.get_selected_entry()
-        if not entry then
-          return
+        path_to_loclist(p, state.win)
+        if entry and entry.value and entry.value.idx then
+          pcall(vim.cmd, "ll " .. tostring(entry.value.idx + 1))
         end
-        local n = #entry.value.frames
-        state.focus = ((state.focus or n) % n) + 1
-        local p = action_state.get_current_picker(bufnr)
-        pcall(function()
-          p:refresh_previewer()
-        end)
-      end)
+        notify(("loclist: %s"):format(path_label(p)))
+      end
+      map({ "i", "n" }, "<CR>", send)
 
-      -- Deepen from the selected path's outermost frame.  This is the answer
-      -- to combinatorial blowup as much as it is a feature: start shallow,
-      -- then go further only along the branch that looks right.
+      -- Deepen from this stack's outermost frame.
       map({ "i", "n" }, "+", function()
-        local entry = action_state.get_selected_entry()
-        if not entry then
-          return
-        end
+        local p = current()
         actions.close(bufnr)
-        M.deepen(entry.value, state)
+        M.deepen(p, state)
       end)
 
       map({ "i", "n" }, "-", function()
@@ -632,6 +622,8 @@ M._internal = {
   path_label = path_label,
   path_to_loclist = path_to_loclist,
   client_for = client_for,
+  frames_of = frames_of,
+  show = show,
   config = function()
     return config
   end,
