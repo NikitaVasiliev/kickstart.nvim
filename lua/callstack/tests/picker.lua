@@ -53,6 +53,7 @@ vim.defer_fn(function()
   ck("[ mapped in both", mapped("[", "i") and mapped("[", "n"))
   ck("<CR> mapped (path -> loclist)", mapped("<CR>", "i") or mapped("<CR>", "n"))
   ck("+ mapped (deepen)", mapped("+", "i") or mapped("+", "n"))
+  ck("<Tab> mapped (loclist, stay open)", mapped("<Tab>", "i") or mapped("<Tab>", "n"))
 
   state.go(state.index + 1)   -- same function ] is bound to
   vim.defer_fn(function()

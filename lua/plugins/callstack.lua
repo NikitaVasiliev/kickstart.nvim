@@ -14,8 +14,9 @@
 --     #3  main         lib.c:60   calls top_2
 --
 -- ] / [   next / previous stack
--- <CR>    whole stack -> loclist, landing on the frame you had selected;
---         the picker stays open so stacks can be compared
+-- <CR>    whole stack -> loclist, then follow to the selected frame; the
+--         loclist cursor lands there too, so ]l / [l carry on from it
+-- <Tab>   same loclist, without leaving -- for comparing stacks first
 -- +       deepen from this stack's outermost frame
 -- -       back to the previous result set
 --

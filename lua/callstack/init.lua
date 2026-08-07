@@ -435,18 +435,42 @@ local function show(state)
         go(state.index - 1)
       end)
 
-      -- Whole stack -> loclist, positioned on the frame that was selected, and
-      -- the picker stays open so other stacks can be compared.
-      local function send()
-        local p = current()
+      local function selected_idx()
         local entry = action_state.get_selected_entry()
-        path_to_loclist(p, state.win)
         if entry and entry.value and entry.value.idx then
-          pcall(vim.cmd, "ll " .. tostring(entry.value.idx + 1))
+          return entry.value.idx
         end
-        notify(("loclist: %s"):format(path_label(p)))
+        return 0
       end
-      map({ "i", "n" }, "<CR>", send)
+
+      -- Whole stack -> loclist, then go to the frame that was selected.  The
+      -- jump goes through :ll rather than editing the file directly, so the
+      -- loclist's own cursor ends up on the same frame and ]l / [l carry on
+      -- from there instead of restarting at the top.
+      local function follow()
+        local p, idx = current(), selected_idx()
+        actions.close(bufnr)
+        path_to_loclist(p, state.win)
+        vim.schedule(function()
+          if state.win and vim.api.nvim_win_is_valid(state.win) then
+            vim.api.nvim_set_current_win(state.win)
+          end
+          vim.cmd("normal! m'") -- leave a jumplist entry, so <C-o> comes back
+          local ok, err = pcall(vim.cmd, "ll " .. tostring(idx + 1))
+          if not ok then
+            notify("could not jump: " .. tostring(err), vim.log.levels.WARN)
+          end
+        end)
+      end
+      map({ "i", "n" }, "<CR>", follow)
+
+      -- Same loclist, without leaving: for comparing stacks with ] / [ before
+      -- committing to one.  <Tab> is free now that j/k walks the frames.
+      map({ "i", "n" }, "<Tab>", function()
+        local p = current()
+        path_to_loclist(p, state.win)
+        notify(("loclist: %s"):format(path_label(p)))
+      end)
 
       -- Deepen from this stack's outermost frame.
       map({ "i", "n" }, "+", function()

@@ -194,6 +194,24 @@ table.insert(steps, function(next_step)
     -- Non-root frames point at the call site, not the callee's definition.
     local second = p.frames[2]
     check("non-root frames carry a call site", second == nil or second.call_lnum ~= nil, vim.inspect(second and second.name))
+
+    -- The mechanism <CR> uses to follow the selected frame: :ll <n> must both
+    -- move the cursor there and leave the loclist's own cursor on that entry,
+    -- so ]l / [l continue from the frame instead of restarting at the top.
+    local want = ll.items[3]
+    if want then
+      vim.cmd("normal! m'")
+      local jumped = pcall(vim.cmd, "ll 3")
+      check(":ll follows to the selected frame", jumped, "ll 3 failed")
+      local pos = vim.api.nvim_win_get_cursor(0)
+      check("cursor lands on that frame's line", pos[1] == want.lnum, ("%d vs %d"):format(pos[1], want.lnum))
+      check("buffer is that frame's file", vim.api.nvim_buf_get_name(0):find("lib.c", 1, true) ~= nil, vim.api.nvim_buf_get_name(0))
+      local idx = vim.fn.getloclist(0, { idx = 0 }).idx
+      check("loclist cursor moved too, so ]l continues", idx == 3, tostring(idx))
+      check("jumplist got an entry, so <C-o> returns", #vim.fn.getjumplist()[1] > 0, "empty jumplist")
+    else
+      check(":ll follows to the selected frame", false, "path too short to test")
+    end
     next_step()
   end)
 end)
