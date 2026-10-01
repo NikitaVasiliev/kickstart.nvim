@@ -57,6 +57,29 @@ return {
         },
       })
 
+      -- PR worktrees built by `pr-review` carry .bkt-review-container: run
+      -- clangd inside that dev container, where compile_commands.json's
+      -- /workspace paths and the system headers (pcs-core) actually exist.
+      opts.servers.clangd = opts.servers.clangd or {}
+      local clangd_cmd = opts.servers.clangd.cmd or { "clangd" }
+      opts.servers.clangd.cmd = function(dispatchers, config)
+        local marker = config.root_dir
+          and vim.fs.find(".bkt-review-container", { upward = true, path = config.root_dir })[1]
+        if not marker then
+          return vim.lsp.rpc.start(clangd_cmd, dispatchers, { cwd = config.cmd_cwd or config.root_dir })
+        end
+        -- marker: container name, then the host copy of its /usr/include
+        local lines = vim.fn.readfile(marker)
+        local maps = vim.fs.dirname(marker) .. "=/workspace"
+        if lines[2] and lines[2] ~= "" then
+          maps = maps .. "," .. lines[2] .. "=/usr/include"
+        end
+        local cmd = { "docker", "exec", "-i", "-w", "/workspace", lines[1], "clangd" }
+        vim.list_extend(cmd, vim.list_slice(clangd_cmd, 2))
+        table.insert(cmd, "--path-mappings=" .. maps)
+        return vim.lsp.rpc.start(cmd, dispatchers)
+      end
+
       opts.servers.pyright = opts.servers.pyright or {}
       opts.servers.pyright.settings = opts.servers.pyright.settings or {}
       opts.servers.pyright.settings.python = vim.tbl_deep_extend(

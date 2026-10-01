@@ -3,6 +3,8 @@
 --
 --   :BktPr               pick a PR (bkt pr list) -> open review
 --   :BktPrReview <id>    open review for a PR id
+--   :BktComments [new]   jump to a thread (new = changed since last look)
+--   :BktPrInterdiff      diff what was pushed since the previous version you saw
 --   :BktReviewClean      prune the per-PR worktrees
 --   :BktPrComments <id>  raw comments JSON (field-mapping debug)
 --
@@ -23,6 +25,9 @@ local config = {
   worktree_dir = vim.fn.stdpath("cache") .. "/bkt-review",
   list_page_size = 20, -- PRs per page in the picker; ] / [ page through (Cloud pagelen, capped at 50)
   list_limit = 0, -- fetch-all fallback only (--mine / non-Cloud): 0 = all, 1..50 = single page
+  -- external helper owning worktree sync + compile-db build (~/.local/bin/pr-review);
+  -- when it is not executable the built-in git logic below is used instead
+  sync_cmd = "pr-review",
 }
 
 -- active review session: { id, src, dst, root, repo, ws, slug, wt, threads = {byid,roots}, by_path = {path -> {threads}} }
@@ -135,8 +140,36 @@ local function cwd()
   return vim.fn.getcwd()
 end
 
+local function has_sync()
+  return vim.fn.executable(config.sync_cmd) == 1
+end
+
+-- ── "last look" store: newest comment timestamp seen per PR ─────────────────
+-- Bitbucket timestamps are uniform ISO-8601 UTC strings, so string compare
+-- orders them; storing the server's own max avoids local clock skew.
+local seen_file = vim.fn.stdpath("state") .. "/bkt-review/seen.json"
+
+local function seen_load()
+  local ok, t = pcall(function()
+    return vim.json.decode(table.concat(vim.fn.readfile(seen_file), "\n"))
+  end)
+  return ok and type(t) == "table" and t or {}
+end
+
+local function seen_put(key, ts)
+  if not ts then
+    return
+  end
+  local t = seen_load()
+  t[key] = ts
+  vim.fn.mkdir(vim.fs.dirname(seen_file), "p")
+  vim.fn.writefile({ vim.json.encode(t) }, seen_file)
+end
+
 -- ── comment normalization ───────────────────────────────────────────────────
-local function normalize_comments(list)
+-- seen: last-look timestamp; a root thread is .new when it or any reply was
+-- created/updated after it. Returns .latest = newest timestamp in the list.
+local function normalize_comments(list, seen)
   local byid = {}
   local function norm(c)
     local inline = val(c.inline) or val(c.anchor) or {}
@@ -157,15 +190,19 @@ local function normalize_comments(list)
         "?"
       ),
       resolved = first(val(c.resolved), val(c.resolution) ~= nil, false),
+      updated = first(c.updated_on, c.created_on),
       replies = {},
     }
   end
-  local all = {}
+  local all, latest = {}, nil
   for _, c in ipairs(list or {}) do
     local n = norm(c)
     if n.id then
       byid[n.id] = n
       all[#all + 1] = n
+      if n.updated and (not latest or n.updated > latest) then
+        latest = n.updated
+      end
     end
   end
   local roots = {}
@@ -176,15 +213,42 @@ local function normalize_comments(list)
       roots[#roots + 1] = n
     end
   end
+  local function is_new(n)
+    if n.updated and n.updated > seen then
+      return true
+    end
+    for _, r in ipairs(n.replies) do
+      if is_new(r) then
+        return true
+      end
+    end
+    return false
+  end
   -- index roots by file path for overlay placement
-  local by_path = {}
+  local by_path, nnew = {}, 0
   for _, t in ipairs(roots) do
+    t.new = seen ~= nil and is_new(t) -- first look ever: nothing is "new"
+    nnew = nnew + (t.new and 1 or 0)
     if t.path then
       by_path[t.path] = by_path[t.path] or {}
       table.insert(by_path[t.path], t)
     end
   end
-  return { byid = byid, roots = roots, by_path = by_path }
+  return { byid = byid, roots = roots, by_path = by_path, latest = latest, nnew = nnew }
+end
+
+-- (re)load the active session's threads against its last-look baseline;
+-- advance=true moves the stored baseline to the newest comment just loaded
+local function set_threads(s, list, advance)
+  s.threads = normalize_comments(list, s.seen_base)
+  if advance then
+    seen_put(s.repo .. "#" .. s.id, s.threads.latest)
+  end
+end
+
+-- load the stored baseline into the session (call before set_threads(.., true))
+local function load_seen_base(s)
+  s.seen_base = seen_load()[s.repo .. "#" .. s.id]
 end
 
 -- ── overlay (read-only): signs + virtual text + thread float ────────────────
@@ -280,6 +344,7 @@ local function overlay_buffer(bufnr, path, side)
         virt_text = {
           { ("  %s %s: %s"):format(t.resolved and "✓" or "💬", t.author, summary(t)), "Comment" },
           n > 1 and { (" (+%d)"):format(n - 1), "DiagnosticVirtualTextInfo" } or { "", "Comment" },
+          t.new and { " ●new", "DiagnosticVirtualTextWarn" } or { "", "Comment" },
         },
         virt_text_pos = "eol",
       })
@@ -438,7 +503,7 @@ local function reload_and_refresh(bufnr)
   end
   bkt_json({ "pr", "comments", tostring(s.id), "--details" }, s.wt, function(c)
     if c then
-      s.threads = normalize_comments(as_list(c) or {})
+      set_threads(s, as_list(c) or {}, false) -- keep the baseline: only open/refresh advance it
     end
     local info = M._buf and M._buf[bufnr]
     if info and api.nvim_buf_is_valid(bufnr) then
@@ -562,6 +627,17 @@ local function ensure_worktree(meta, cb)
   local branch = "bkt-review/pr" .. meta.id
   meta.branch = branch
 
+  -- pr-review owns create/update (same path + branch), incl. force-push resets
+  if has_sync() then
+    notify(("syncing PR #%s …"):format(meta.id))
+    return sh({ config.sync_cmd, "sync", tostring(meta.id), "--no-build" }, meta.root, function(ok, _, err)
+      if not ok then
+        return notify("pr-review sync failed: " .. vim.trim(err), vim.log.levels.ERROR)
+      end
+      cb(path)
+    end)
+  end
+
   local function finish()
     -- fetch the destination branch so origin/<dst> exists as the diff base
     sh({ "git", "-C", path, "fetch", "origin", meta.dst or "HEAD" }, nil, function()
@@ -613,9 +689,10 @@ local function open_review(meta, wt)
     return
   end
   -- load comments (in the worktree so bkt detects the repo), then open diffview
+  load_seen_base(meta)
   bkt_json({ "pr", "comments", tostring(meta.id), "--details" }, wt, function(comments, err)
     if comments then
-      meta.threads = normalize_comments(as_list(comments) or {})
+      set_threads(meta, as_list(comments) or {}, true)
     else
       meta.threads = { byid = {}, roots = {}, by_path = {} }
       notify("comments load failed (continuing without overlay): " .. err, vim.log.levels.WARN)
@@ -629,7 +706,14 @@ local function open_review(meta, wt)
     end
     meta.tab = api.nvim_get_current_tabpage()
     local nthreads = #meta.threads.roots
-    notify(("PR #%s — worktree %s — %d threads. <CR> on 💬 to view."):format(meta.id, wt, nthreads))
+    notify(
+      ("PR #%s — worktree %s — %d threads (%d new). <CR> on 💬 to view."):format(
+        meta.id,
+        wt,
+        nthreads,
+        meta.threads.nnew or 0
+      )
+    )
   end)
 end
 
@@ -676,25 +760,15 @@ function M.review(pr)
   if type(pr) == "table" then
     return go(pr)
   end
-  -- bare id: fetch the PR object from the list (with --mine fallback)
+  -- bare id: fetch the PR object directly (bkt pr view → {pull_request = {...}})
   local id = tostring(pr)
-  local function fetch(args, retry)
-    bkt_json(args, cwd(), function(prs, err)
-      if not prs then
-        if retry and err:match("%-%-mine is required") then
-          return fetch(vim.list_extend(vim.deepcopy(args), { "--mine" }), false)
-        end
-        return notify("could not fetch PR #" .. id .. ": " .. err, vim.log.levels.ERROR)
-      end
-      for _, p in ipairs(as_list(prs) or {}) do
-        if tostring(first(p.id, p.number)) == id then
-          return go(p)
-        end
-      end
-      notify("PR #" .. id .. " not found in list — open via :BktPr picker", vim.log.levels.ERROR)
-    end)
-  end
-  fetch({ "pr", "list" }, true)
+  bkt_json({ "pr", "view", id }, cwd(), function(r, err)
+    local p = r and first(r.pull_request, r)
+    if type(p) ~= "table" or not first(p.id, p.number) then
+      return notify("could not fetch PR #" .. id .. ": " .. (err or "unexpected JSON"), vim.log.levels.ERROR)
+    end
+    go(p)
+  end)
 end
 
 -- root threads with a file anchor, ordered by file then line
@@ -779,17 +853,25 @@ function M.goto_thread(t)
 end
 
 -- Telescope (or vim.ui.select) picker over the active review's comment threads.
-function M.comments_picker()
+-- filter == "new": only threads created/updated since the last look (<C-n> toggles).
+function M.comments_picker(filter)
   local s = M.active
   if not s or not s.threads then
     return notify("no active review — open one with :BktPr")
   end
-  local items = sorted_threads(s)
-  if #items == 0 then
-    return notify("no comments on this PR")
+  local only_new = filter == "new"
+  local all = sorted_threads(s)
+  local function current()
+    return only_new and vim.tbl_filter(function(t)
+      return t.new
+    end, all) or all
   end
-  local function remember(t) -- keep ]/[ in sync with picker selection
-    for i, x in ipairs(items) do
+  local items = current()
+  if #items == 0 then
+    return notify(only_new and "no new comments since last look" or "no comments on this PR")
+  end
+  local function remember(t) -- keep ]/[ (which walk all threads) in sync with picker selection
+    for i, x in ipairs(all) do
       if x == t then
         s._idx = i
         return
@@ -798,7 +880,8 @@ function M.comments_picker()
   end
 
   local function label(t)
-    return ("%s %s:%s  %s  %s"):format(
+    return ("%s%s %s:%s  %s  %s"):format(
+      t.new and "● " or "",
       t.resolved and "✓" or "💬",
       t.path or "?",
       t.to or t.from or "?",
@@ -822,21 +905,29 @@ function M.comments_picker()
   local conf = require("telescope.config").values
   local actions = require("telescope.actions")
   local astate = require("telescope.actions.state")
+  local function finder()
+    return finders.new_table({
+      results = items,
+      entry_maker = function(t)
+        return {
+          value = t,
+          display = label(t),
+          ordinal = (t.path or "") .. " " .. t.author .. " " .. summary(t),
+        }
+      end,
+    })
+  end
   pickers
     .new({}, {
-      prompt_title = "PR #" .. s.id .. " comments",
-      finder = finders.new_table({
-        results = items,
-        entry_maker = function(t)
-          return {
-            value = t,
-            display = label(t),
-            ordinal = (t.path or "") .. " " .. t.author .. " " .. summary(t),
-          }
-        end,
-      }),
+      prompt_title = "PR #" .. s.id .. " comments  (<C-n> new only)",
+      finder = finder(),
       sorter = conf.generic_sorter({}),
-      attach_mappings = function(bufnr)
+      attach_mappings = function(bufnr, map)
+        map({ "i", "n" }, "<C-n>", function()
+          only_new = not only_new
+          items = current()
+          astate.get_current_picker(bufnr):refresh(finder(), { reset_prompt = false })
+        end)
         actions.select_default:replace(function()
           actions.close(bufnr)
           local e = astate.get_selected_entry()
@@ -1049,9 +1140,10 @@ function M.refresh()
   notify("refreshing PR #" .. s.id .. " …")
 
   local function finish()
+    load_seen_base(s)
     bkt_json({ "pr", "comments", tostring(s.id), "--details" }, s.wt, function(c)
       if c then
-        s.threads = normalize_comments(as_list(c) or {})
+        set_threads(s, as_list(c) or {}, true)
       end
       if s.tab and api.nvim_tabpage_is_valid(s.tab) then
         pcall(api.nvim_set_current_tabpage, s.tab)
@@ -1062,7 +1154,19 @@ function M.refresh()
       if info and api.nvim_buf_is_valid(bufnr) then
         overlay_buffer(bufnr, info.path, info.side)
       end
-      notify(("PR #%s refreshed — %d threads"):format(s.id, #s.threads.roots))
+      notify(("PR #%s refreshed — %d threads, %d new"):format(s.id, #s.threads.roots, s.threads.nnew or 0))
+    end)
+  end
+
+  -- pr-review updates the worktree (ff, or reset on a force-push when clean),
+  -- then the compile db is rebuilt in the background
+  if has_sync() then
+    return sh({ config.sync_cmd, "sync", tostring(s.id), "--no-build" }, s.root, function(ok, _, err)
+      if not ok then
+        notify("pr-review sync failed — comments+diff refreshed: " .. vim.trim(err), vim.log.levels.WARN)
+      end
+      finish()
+      M.build()
     end)
   end
 
@@ -1083,6 +1187,45 @@ function M.refresh()
     else
       fetch_dest_then_finish()
     end
+  end)
+end
+
+-- rebuild the active review's compile_commands.json in its dev container
+-- (pr-review serializes builds, so a refresh mid-build just queues)
+function M.build()
+  local s = M.active
+  if not (s and has_sync()) then
+    return
+  end
+  notify("building compile db for PR #" .. s.id .. " …")
+  sh({ config.sync_cmd, "build", tostring(s.id) }, s.wt, function(ok)
+    local log = vim.fn.systemlist({ "git", "-C", s.wt, "rev-parse", "--path-format=absolute", "--git-dir" })[1]
+    log = (log or "?") .. "/bkt-review-build.log"
+    if ok then
+      notify("PR #" .. s.id .. " build ok — compile db updated")
+    else
+      notify("PR #" .. s.id .. " build failed (db still updated) — log: " .. log, vim.log.levels.WARN)
+    end
+  end)
+end
+
+-- diff what the author pushed since the previous version you looked at
+-- (pr-review records the pre-update HEAD as refs/bkt-review/pr<id>/seen)
+function M.interdiff()
+  local s = M.active
+  if not s then
+    return notify("no active review — open one with :BktPr")
+  end
+  local ref = "refs/bkt-review/pr" .. s.id .. "/seen"
+  sh({ "git", "-C", s.wt, "rev-parse", "--verify", "-q", ref }, nil, function(ok)
+    if not ok then
+      return notify("no update since first look (no " .. ref .. ")")
+    end
+    if s.tab and api.nvim_tabpage_is_valid(s.tab) then
+      pcall(api.nvim_set_current_tabpage, s.tab)
+    end
+    vim.cmd("DiffviewOpen " .. ref .. "..HEAD")
+    notify("interdiff " .. ref .. "..HEAD (includes upstream changes if the author rebased)")
   end)
 end
 
@@ -1791,6 +1934,23 @@ function M.clean()
     return notify("no worktrees")
   end
   local n = 0
+  -- pr-review cleans per repo and also removes the per-PR dev containers + refs;
+  -- whatever it leaves behind falls through to the plain removal below
+  if has_sync() then
+    local roots = {}
+    for _, d in ipairs(dirs) do
+      local common = vim.fn.systemlist({ "git", "-C", d, "rev-parse", "--path-format=absolute", "--git-common-dir" })[1]
+      if common and vim.v.shell_error == 0 then
+        roots[vim.fn.fnamemodify(common, ":h")] = true
+      end
+    end
+    for root in pairs(roots) do
+      vim.system({ config.sync_cmd, "clean", "--all" }, { cwd = root }):wait()
+    end
+    n = #dirs
+    dirs = vim.fn.globpath(base, "*", false, true)
+    n = n - #dirs
+  end
   for _, d in ipairs(dirs) do
     -- resolve the main worktree to run `worktree remove` from
     local common = vim.fn.systemlist({ "git", "-C", d, "rev-parse", "--path-format=absolute", "--git-common-dir" })[1]
@@ -1825,8 +1985,16 @@ function M.setup(opts)
   api.nvim_create_user_command("BktPrReview", function(o)
     M.review(o.args)
   end, { nargs = 1 })
-  api.nvim_create_user_command("BktComments", function()
-    M.comments_picker()
+  api.nvim_create_user_command("BktComments", function(o)
+    M.comments_picker(o.args ~= "" and o.args or nil)
+  end, {
+    nargs = "?",
+    complete = function()
+      return { "new" }
+    end,
+  })
+  api.nvim_create_user_command("BktPrInterdiff", function()
+    M.interdiff()
   end, {})
   api.nvim_create_user_command("BktPrWeb", function()
     M.open_in_browser()
@@ -1896,7 +2064,13 @@ function M.setup(opts)
   end, "toggle request-changes")
   map("R", function()
     M.refresh()
-  end, "refresh PR (fetch + comments)")
+  end, "refresh PR (fetch + comments + compile db)")
+  map("I", function()
+    M.interdiff()
+  end, "interdiff since previous look")
+  map("N", function()
+    M.comments_picker("new")
+  end, "new comments since last look")
   map("E", function()
     M.export_revdiff()
   end, "export comments → revdiff")
