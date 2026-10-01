@@ -681,6 +681,38 @@ local function ensure_worktree(meta, cb)
   end
 end
 
+-- open a Diffview tab on the worktree from whatever tab we are in: the tcd
+-- (inherited by Diffview's tab) keeps getcwd() == wt for the overlay hook,
+-- and -C pins git to the worktree
+local function open_diff_tab(wt, range)
+  local dir = vim.fn.fnameescape(wt)
+  vim.cmd("tabnew")
+  vim.cmd("tcd " .. dir)
+  local scratch = api.nvim_get_current_tabpage()
+  local okq = pcall(vim.cmd, ("DiffviewOpen -C%s %s"):format(dir, range))
+  if not okq then
+    pcall(vim.cmd, "DiffviewOpen -C" .. dir) -- fallback: working tree
+  end
+  local tab = api.nvim_get_current_tabpage()
+  if tab ~= scratch and api.nvim_tabpage_is_valid(scratch) then
+    vim.cmd("tabclose " .. api.nvim_tabpage_get_number(scratch)) -- Diffview opened its own tab
+  end
+  return tab
+end
+
+-- (re)open the review tab: the full PR diff against the merge-base
+local function open_review_tab(s)
+  s.tab = open_diff_tab(s.wt, (s.dst and ("origin/" .. s.dst) or "HEAD") .. "...HEAD")
+end
+
+local function focus_review(s)
+  if s.tab and api.nvim_tabpage_is_valid(s.tab) then
+    api.nvim_set_current_tabpage(s.tab)
+  else
+    open_review_tab(s)
+  end
+end
+
 local function open_review(meta, wt)
   meta.wt = wt
   M.active = meta
@@ -697,14 +729,7 @@ local function open_review(meta, wt)
       meta.threads = { byid = {}, roots = {}, by_path = {} }
       notify("comments load failed (continuing without overlay): " .. err, vim.log.levels.WARN)
     end
-    vim.cmd("tabnew")
-    vim.cmd("tcd " .. vim.fn.fnameescape(wt))
-    local base = meta.dst and ("origin/" .. meta.dst) or "HEAD"
-    local okq = pcall(vim.cmd, "DiffviewOpen " .. base .. "...HEAD")
-    if not okq then
-      pcall(vim.cmd, "DiffviewOpen") -- fallback: working tree
-    end
-    meta.tab = api.nvim_get_current_tabpage()
+    open_review_tab(meta)
     local nthreads = #meta.threads.roots
     notify(
       ("PR #%s — worktree %s — %d threads (%d new). <CR> on 💬 to view."):format(
@@ -1147,8 +1172,10 @@ function M.refresh()
       end
       if s.tab and api.nvim_tabpage_is_valid(s.tab) then
         pcall(api.nvim_set_current_tabpage, s.tab)
+        pcall(vim.cmd, "DiffviewRefresh")
+      else
+        open_review_tab(s) -- the review tab was closed: bring it back
       end
-      pcall(vim.cmd, "DiffviewRefresh")
       local bufnr = api.nvim_get_current_buf()
       local info = M._buf and M._buf[bufnr]
       if info and api.nvim_buf_is_valid(bufnr) then
@@ -1210,22 +1237,28 @@ function M.build()
 end
 
 -- diff what the author pushed since the previous version you looked at
--- (pr-review records the pre-update HEAD as refs/bkt-review/pr<id>/seen)
+-- (pr-review records the pre-update HEAD as refs/bkt-review/pr<id>/seen);
+-- called again from the interdiff tab, it closes it and returns to the review
 function M.interdiff()
   local s = M.active
   if not s then
     return notify("no active review — open one with :BktPr")
+  end
+  if s.itab and s.itab == api.nvim_get_current_tabpage() then
+    vim.cmd("DiffviewClose")
+    s.itab = nil
+    return focus_review(s)
   end
   local ref = "refs/bkt-review/pr" .. s.id .. "/seen"
   sh({ "git", "-C", s.wt, "rev-parse", "--verify", "-q", ref }, nil, function(ok)
     if not ok then
       return notify("no update since first look (no " .. ref .. ")")
     end
-    if s.tab and api.nvim_tabpage_is_valid(s.tab) then
-      pcall(api.nvim_set_current_tabpage, s.tab)
+    if s.itab and api.nvim_tabpage_is_valid(s.itab) then
+      return api.nvim_set_current_tabpage(s.itab) -- already open
     end
-    vim.cmd("DiffviewOpen " .. ref .. "..HEAD")
-    notify("interdiff " .. ref .. "..HEAD (includes upstream changes if the author rebased)")
+    s.itab = open_diff_tab(s.wt, ref .. "..HEAD")
+    notify("interdiff " .. ref .. "..HEAD (includes upstream changes if the author rebased); <leader>pI again to go back")
   end)
 end
 
@@ -2067,7 +2100,7 @@ function M.setup(opts)
   end, "refresh PR (fetch + comments + compile db)")
   map("I", function()
     M.interdiff()
-  end, "interdiff since previous look")
+  end, "interdiff since previous look (toggle)")
   map("N", function()
     M.comments_picker("new")
   end, "new comments since last look")
