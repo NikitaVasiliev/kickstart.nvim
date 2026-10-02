@@ -1700,9 +1700,49 @@ function M.pipeline_run()
   end
 end
 
+-- my Bitbucket uuid, looked up once: marks the PRs I approved in the pickers
+local my_uuid
+local function with_me(cb)
+  if my_uuid ~= nil then
+    return cb()
+  end
+  bkt_json({ "api", "/user", "--param", "fields=uuid" }, nil, function(d)
+    my_uuid = d and val(d.uuid) or false -- false: lookup failed, don't retry
+    cb()
+  end)
+end
+
+-- ✓ = I approved, ✗ = I requested changes (needs participants in the payload)
+local function pr_mark(p)
+  for _, part in ipairs(as_list(val(p.participants)) or {}) do
+    if my_uuid and dig(part, "user", "uuid") == my_uuid then
+      if val(part.approved) == true then
+        return "✓"
+      end
+      return val(part.state) == "changes_requested" and "✗" or " "
+    end
+  end
+  return " "
+end
+
+-- stable partition: the PRs I approved go last
+local function approved_last(list)
+  local todo, done = {}, {}
+  for _, p in ipairs(list) do
+    table.insert(pr_mark(p) == "✓" and done or todo, p)
+  end
+  return vim.list_extend(todo, done)
+end
+
 local function pr_label(p)
   local author = dig(p, "author", "display_name") or dig(p, "author", "nickname") or dig(p, "author", "name") or "?"
-  return ("#%s  [%s]  %s  — %s"):format(first(p.id, p.number), first(p.state, "?"), first(p.title, "?"), author)
+  return ("%s #%s  [%s]  %s  — %s"):format(
+    pr_mark(p),
+    first(p.id, p.number),
+    first(p.state, "?"),
+    first(p.title, "?"),
+    author
+  )
 end
 
 -- Telescope picker over the PR list, paged config.list_page_size at a time.
@@ -1817,7 +1857,7 @@ local function pr_picker_lazy(loader, page_size, on_choice)
   local function title()
     local of = last_page and ("/" .. last_page) or "+"
     local tot = total_count and (" · %d total"):format(total_count) or ""
-    return ("Bitbucket PR — page %d%s%s (] / [)"):format(page, of, tot)
+    return ("Bitbucket PR — page %d%s%s (] / [) · ✓ approved by you, last"):format(page, of, tot)
   end
   local function show(rows)
     picker:refresh(finders.new_table({ results = rows, entry_maker = entry_maker }), { reset_prompt = true })
@@ -1914,17 +1954,22 @@ function M.pick(extra)
     local path = ("/repositories/%s/%s/pullrequests"):format(ws, slug)
     local dir = cwd()
     local function loader(pageno, cb)
-      bkt_json({ "api", path, "--param", "state=" .. state, "--param", "pagelen=" .. size, "--param", "page=" .. pageno }, dir, function(d, err)
+      local args = { "api", path, "--param", "state=" .. state, "--param", "pagelen=" .. size }
+      vim.list_extend(args, { "--param", "page=" .. pageno, "--param", "fields=+values.participants" })
+      bkt_json(args, dir, function(d, err)
         if not d then
           notify("list failed: " .. err, vim.log.levels.ERROR)
           return cb(nil)
         end
         -- `next` is authoritative for "more pages exist"; `size` over-counts.
-        cb(as_list(d) or {}, tonumber(d.size), val(d.next) ~= nil)
+        -- approved-last within the page: server pages can't be reordered globally
+        cb(approved_last(as_list(d) or {}), tonumber(d.size), val(d.next) ~= nil)
       end)
     end
-    return pr_picker_lazy(loader, size, function(choice)
-      M.review(choice)
+    return with_me(function()
+      pr_picker_lazy(loader, size, function(choice)
+        M.review(choice)
+      end)
     end)
   end
 
@@ -1949,8 +1994,10 @@ function M.pick(extra)
       if not list or #list == 0 then
         return notify("no PRs for this scope — try :BktPr --mine")
       end
-      pr_picker(list, function(choice)
-        M.review(choice)
+      with_me(function()
+        pr_picker(approved_last(list), function(choice)
+          M.review(choice)
+        end)
       end)
     end)
   end
