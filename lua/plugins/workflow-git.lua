@@ -51,6 +51,34 @@ return {
         vim.cmd("wincmd _")
       end
 
+      -- gf on a diff side whose commit has a rev-review worktree opens the
+      -- file there, so LSP answers for that revision; else diffview's own gf
+      local function goto_side_file()
+        local lib = require("diffview.lib")
+        local view = lib.get_current_view()
+        local layout = view and view.cur_layout
+        local cur = vim.api.nvim_get_current_win()
+        local win = layout and ((layout.a and layout.a.id == cur and layout.a) or (layout.b and layout.b.id == cur and layout.b))
+        local file = win and win.file
+        local commit = file and file.rev and file.rev.commit
+        local wt = commit and vim.fn.glob(vim.fn.stdpath("cache") .. "/rev-review/*-" .. commit:sub(1, 12), false, true)[1]
+        if not wt then
+          return require("diffview.actions").goto_file_edit()
+        end
+        local path = wt .. "/" .. file.path
+        if file.nulled or vim.fn.filereadable(path) == 0 then
+          return vim.notify(file.path .. " does not exist at " .. commit:sub(1, 12), vim.log.levels.WARN)
+        end
+        local line = vim.api.nvim_win_get_cursor(cur)[1]
+        local tab = lib.get_prev_non_view_tabpage()
+        if tab then
+          vim.api.nvim_set_current_tabpage(tab)
+        else
+          vim.cmd("tabnew")
+        end
+        vim.cmd(("edit +%d %s"):format(line, vim.fn.fnameescape(path)))
+      end
+
       local function diffview_opts()
         -- Characters are ~2x taller than wide, so on a portrait screen cols/lines < 2
         local portrait = vim.o.columns < vim.o.lines * 2
@@ -68,6 +96,7 @@ return {
             view = {
               { "n", "[o", function() focus_diff_side("a") end, { desc = "Show old revision" } },
               { "n", "]o", function() focus_diff_side("b") end, { desc = "Show new revision" } },
+              { "n", "gf", goto_side_file, { desc = "Open file at this side's revision" } },
               { "n", "<leader>Gk", toggle_checked_file, { desc = "Toggle file checked" } },
             },
             file_panel = {
