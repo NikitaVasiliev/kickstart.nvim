@@ -7,37 +7,108 @@ local M = {}
 local CODE = "RenderMarkdownCodeInline"
 local width = vim.fn.strdisplaywidth
 
+local MARKUP = {
+  strong_emphasis = "@markup.strong",
+  emphasis = "@markup.italic",
+  strikethrough = "@markup.strikethrough",
+  code_span = CODE,
+}
+local HIDE = { emphasis_delimiter = true, code_span_delimiter = true }
+-- link node -> key of its icon in render-markdown's `link` config
+local LINKS = {
+  inline_link = "hyperlink",
+  full_reference_link = "hyperlink",
+  uri_autolink = "hyperlink",
+  image = "image",
+  email_autolink = "email",
+}
+
 -- Cell text -> words; a word is a list of {text, hl} chunks, word.sp is the
--- highlight of the space before it. Only code spans are highlighted.
--- ponytail: bold/italic/links render as raw text; take spans from the
--- markdown_inline tree if that matters.
-function M.words(text, hl)
+-- highlight of the space before it. Inline markup comes from the
+-- markdown_inline tree: delimiters and link targets are hidden, link icons
+-- (from render-markdown's `link` config) are prepended.
+function M.words(text, hl, link)
+  -- GFM unescapes \| in table cells before inline parsing, code spans included
   text = vim.trim(text):gsub("\\|", "|")
-  local words, glue = {}, false
-  local function add(seg, h)
-    local first = true
-    for space, w in seg:gmatch("(%s*)(%S+)") do
-      if glue and space == "" and #words > 0 then
-        table.insert(words[#words], { w, h })
-      else
-        words[#words + 1] = { { w, h }, sp = (h == CODE and not first) and CODE or nil }
-      end
-      glue, first = true, false
-    end
-    if seg ~= "" then
-      glue = not seg:find("%s$")
+  local hls, hide, prefix = {}, {}, {}
+  local function each(s, e, f)
+    for i = s + 1, e do
+      f(i)
     end
   end
-  local pos = 1
-  while true do
-    local s, e, code = text:find("`([^`]+)`", pos)
-    if not s then
-      add(text:sub(pos), hl)
-      break
+  local function walk(node)
+    local t = node:type()
+    local _, s, _, e = node:range()
+    local group = MARKUP[t] or (LINKS[t] and "@markup.link.label")
+    if group then
+      each(s, e, function(i)
+        hls[i] = hls[i] or {}
+        table.insert(hls[i], group)
+      end)
     end
-    add(text:sub(pos, s - 1), hl)
-    add(code, CODE)
-    pos = e + 1
+    if HIDE[t] then
+      each(s, e, function(i)
+        hide[i] = true
+      end)
+    elseif t == "backslash_escape" then
+      hide[s + 1] = true
+    elseif LINKS[t] then
+      local ks, ke = s + 1, e - 1 -- autolinks: keep all but < >
+      for child in node:iter_children() do
+        if child:type() == "link_text" or child:type() == "image_description" then
+          _, ks, _, ke = child:range()
+        end
+      end
+      each(s, e, function(i)
+        hide[i] = i <= ks or i > ke
+      end)
+      if link and link.enabled then
+        prefix[ks + 1] = link[LINKS[t]]
+      end
+    end
+    for child in node:iter_children() do
+      walk(child)
+    end
+  end
+  walk(vim.treesitter.get_string_parser(text, "markdown_inline"):parse()[1]:root())
+
+  -- equal highlight lists share one table so chunks with them can merge
+  local cache = {}
+  local function hl_of(list)
+    local all = vim.list_extend({ hl }, list or {})
+    if #all <= 1 then
+      return all[1]
+    end
+    local key = table.concat(all, ",")
+    cache[key] = cache[key] or all
+    return cache[key]
+  end
+  local words, word, sp = {}, nil, nil
+  local function put(s, h)
+    if not word then
+      word = { sp = sp }
+      words[#words + 1] = word
+    end
+    local last = word[#word]
+    if last and last[2] == h then
+      last[1] = last[1] .. s
+    else
+      word[#word + 1] = { s, h }
+    end
+  end
+  local starts = vim.str_utf_pos(text)
+  for n, p in ipairs(starts) do
+    if prefix[p] then
+      put(prefix[p], link.highlight)
+    end
+    if not hide[p] then
+      local ch = text:sub(p, (starts[n + 1] or #text + 1) - 1)
+      if ch:match("^%s$") then
+        word, sp = nil, hl_of(hls[p])
+      else
+        put(ch, hl_of(hls[p]))
+      end
+    end
   end
   return words
 end
@@ -145,7 +216,7 @@ local function render(self)
     local hl = row.node.type == "pipe_table_header" and "@markup.strong" or nil
     rows[r] = {}
     for c, cell in ipairs(row.cells) do
-      rows[r][c] = M.words(cell.node.text, hl)
+      rows[r][c] = M.words(cell.node.text, hl, ctx.config.link)
       naturals[c] = math.max(naturals[c], line_width(M.wrap(rows[r][c], math.huge)[1]))
     end
   end
@@ -251,6 +322,14 @@ function M._check()
   assert(#lines == 3 and lines[3][1][1] == "ij", vim.inspect(lines))
   lines = M.wrap(M.words("x `p q`", nil), 10)
   assert(vim.deep_equal(lines[1], { { "x ", nil }, { "p q", CODE } }), vim.inspect(lines))
+  local link = { enabled = true, hyperlink = "@", highlight = "L" }
+  words = M.words("**b** [l](u) <http://u>", nil, link)
+  assert(vim.deep_equal(words[1][1], { "b", "@markup.strong" }), vim.inspect(words))
+  assert(vim.deep_equal(words[2], { { "@", "L" }, { "l", "@markup.link.label" } }), vim.inspect(words[2]))
+  assert(words[3][2][1] == "http://u", vim.inspect(words[3]))
+  assert(M.words("`a \\| b`")[2][1][1] == "|", "\\| unescaped inside code")
+  words = M.words("**x** y", "H")
+  assert(vim.deep_equal(words[1][1], { "x", { "H", "@markup.strong" } }) and words[2][1][2] == "H", vim.inspect(words))
   print("md_table_wrap: ok")
 end
 
