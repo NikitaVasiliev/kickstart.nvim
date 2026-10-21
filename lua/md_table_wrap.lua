@@ -180,6 +180,19 @@ function M.col_widths(naturals, budget)
   return widths
 end
 
+-- Extmarks are per buffer, so fit the narrowest window showing it in this
+-- tab (e.g. a zen float over the original window), not just ctx.win.
+local function text_width(buf, fallback)
+  local tab, w = vim.api.nvim_get_current_tabpage(), nil
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_get_tabpage(win) == tab then
+      local ww = vim.api.nvim_win_get_width(win) - vim.fn.getwininfo(win)[1].textoff
+      w = math.min(w or ww, ww)
+    end
+  end
+  return w or vim.api.nvim_win_get_width(fallback) - vim.fn.getwininfo(fallback)[1].textoff
+end
+
 local function line_width(chunks)
   local n = 0
   for _, c in ipairs(chunks) do
@@ -195,7 +208,7 @@ local function render(self)
     return false
   end
   local ncols = #data.cols
-  local avail = vim.api.nvim_win_get_width(ctx.win) - vim.fn.getwininfo(ctx.win)[1].textoff
+  local avail = text_width(ctx.buf, ctx.win)
   local natural = data.layout.col + ncols + 1
   for _, col in ipairs(data.cols) do
     natural = natural + col.width
@@ -302,6 +315,24 @@ function M.setup()
       run(self)
     end
   end
+
+  -- render-markdown skips re-rendering a buffer that didn't change, so a
+  -- window opened or closed on it (zen float) would keep the old table width.
+  vim.api.nvim_create_autocmd({ "WinNew", "WinClosed" }, {
+    group = vim.api.nvim_create_augroup("md_table_wrap", {}),
+    callback = function()
+      vim.schedule(function()
+        local seen = {}
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+          local buf = vim.api.nvim_win_get_buf(win)
+          if not seen[buf] and vim.bo[buf].filetype == "markdown" then
+            seen[buf] = true
+            require("render-markdown").render({ buf = buf, event = "md_table_wrap" })
+          end
+        end
+      end)
+    end,
+  })
 end
 
 function M._check()
