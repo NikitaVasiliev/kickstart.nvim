@@ -84,6 +84,13 @@ return {
       opts.servers.pyright.settings = opts.servers.pyright.settings or {}
       opts.servers.pyright.settings.python = vim.tbl_deep_extend(
         "force",
+      -- rev-review links each worktree's .venv; the global pythonPath is cwd's, wrong for the other side
+      opts.servers.pyright.before_init = function(_, config)
+        local py = config.root_dir and config.root_dir .. "/.venv/bin/python"
+        if py and vim.fn.executable(py) == 1 then
+          config.settings.python.pythonPath = py
+        end
+      end
         opts.servers.pyright.settings.python or {},
         { pythonPath = get_python_path() }
       )
