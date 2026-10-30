@@ -5,6 +5,7 @@
 local M = {}
 
 local CODE = "RenderMarkdownCodeInline"
+local DELETE = "DiffviewDiffDelete"
 local width = vim.fn.strdisplaywidth
 
 local MARKUP = {
@@ -201,19 +202,57 @@ local function line_width(chunks)
   return n
 end
 
+-- Raw table row -> cell texts, split on unescaped pipes
+function M.split_row(line)
+  local s = vim.trim(line)
+  local cells, cur, prev = {}, {}, nil
+  for ch in s:gmatch(".") do
+    if ch == "|" and prev ~= "\\" then
+      cells[#cells + 1] = table.concat(cur)
+      cur = {}
+    else
+      cur[#cur + 1] = ch
+    end
+    prev = ch
+  end
+  cells[#cells + 1] = table.concat(cur)
+  if s:sub(1, 1) == "|" then
+    table.remove(cells, 1)
+  end
+  if s:sub(-1) == "|" and s:sub(-2, -2) ~= "\\" and #s > 1 then
+    table.remove(cells)
+  end
+  return cells
+end
+
+-- The diffview inline diff (see diffview_inline_wrap), if it touches rows first..last
+local function table_diff(buf, first, last)
+  local dv = package.loaded.diffview_inline_wrap
+  local d = dv and dv.table_diff(buf)
+  for r = first, last do
+    if d and (d.hl[r] or d.before[r] or d.after[r]) then
+      return d
+    end
+  end
+end
+
 -- Returns false when the table should get the plugin's normal rendering.
 local function render(self)
   local cfg, data, ctx = self.config, self.data, self.context
   if not (cfg.cell == "padded" or cfg.cell == "trimmed") or not data.layout.valid then
     return false
   end
+  local first, last = data.rows[1].node.start_row, data.rows[#data.rows].node.start_row
+  -- In a diff the raw rows carry the +/- colours, so always draw the table
+  -- ourselves with the diff folded in: deleted rows in place, rows tinted.
+  local diff = table_diff(ctx.buf, first, last)
   local ncols = #data.cols
   local avail = text_width(ctx.buf, ctx.win)
   local natural = data.layout.col + ncols + 1
   for _, col in ipairs(data.cols) do
     natural = natural + col.width
   end
-  if natural <= avail then
+  if natural <= avail and not diff then
     return false
   end
   local budget = avail - data.layout.col - (ncols + 1) - 2 * cfg.padding * ncols
@@ -221,16 +260,52 @@ local function render(self)
     return false
   end
 
-  local rows, naturals = {}, {}
+  local link = ctx.config.link
+  -- entries: table rows ({[col] = words}), the header rule ({rule = true})
+  -- and deleted non-table lines ({raw = words}); `hl` is the diff highlight
+  local entries = {}
+  local function deleted(lines)
+    for _, l in ipairs(lines or {}) do
+      if l:match("^%s*|[%s|:%-]*$") and l:find("-", 1, true) then
+        -- old delimiter row: its change shows on the rule
+      elseif l:match("^%s*|") then
+        local cells, e = M.split_row(l), { hl = DELETE }
+        for c = 1, ncols do
+          e[c] = M.words(cells[c] or "", nil, link)
+        end
+        entries[#entries + 1] = e
+      else
+        entries[#entries + 1] = { hl = DELETE, raw = M.words(l, nil, link) }
+      end
+    end
+  end
+  for _, row in ipairs(data.rows) do
+    local r0 = row.node.start_row
+    local header = row.node.type == "pipe_table_header"
+    deleted(diff and diff.before[r0])
+    local e = { header = header, hl = diff and diff.hl[r0] }
+    for c, cell in ipairs(row.cells) do
+      e[c] = M.words(cell.node.text, header and "@markup.strong" or nil, link)
+    end
+    entries[#entries + 1] = e
+    deleted(diff and diff.after[r0])
+    if header then
+      local d = data.delim.start_row
+      deleted(diff and diff.before[d])
+      entries[#entries + 1] = { rule = true, hl = diff and diff.hl[d] }
+      deleted(diff and diff.after[d])
+    end
+  end
+
+  local naturals = {}
   for c = 1, ncols do
     naturals[c] = 1
   end
-  for r, row in ipairs(data.rows) do
-    local hl = row.node.type == "pipe_table_header" and "@markup.strong" or nil
-    rows[r] = {}
-    for c, cell in ipairs(row.cells) do
-      rows[r][c] = M.words(cell.node.text, hl, ctx.config.link)
-      naturals[c] = math.max(naturals[c], line_width(M.wrap(rows[r][c], math.huge)[1]))
+  for _, e in ipairs(entries) do
+    for c = 1, ncols do
+      if e[c] then
+        naturals[c] = math.max(naturals[c], line_width(M.wrap(e[c], math.huge)[1]))
+      end
     end
   end
   local widths = M.col_widths(naturals, budget)
@@ -240,7 +315,18 @@ local function render(self)
   local function new_line()
     return self:indent():line(true):pad(data.layout.col)
   end
-  local function rule(l, m, r, hl, indicators)
+  -- Stack the diff highlight under each chunk: syntax keeps its fg, the
+  -- row gets the diff bg (the padding highlight would paint over it).
+  local padding_hl = ctx.config.padding.highlight
+  local function push(line, hl)
+    local chunks = line:get()
+    for _, c in ipairs(hl and chunks or {}) do
+      local h = c[2]
+      c[2] = (h == nil or h == padding_hl) and hl or vim.list_extend({ hl }, type(h) == "table" and h or { h })
+    end
+    virt[#virt + 1] = chunks
+  end
+  local function rule(l, m, r, hl, indicators, diff_hl)
     local parts = {}
     for c, w in ipairs(widths) do
       local seg = b[11]:rep(w + 2 * pad)
@@ -252,41 +338,52 @@ local function render(self)
       end
       parts[c] = seg
     end
-    virt[#virt + 1] = new_line():text(l .. table.concat(parts, m) .. r, hl):get()
+    push(new_line():text(l .. table.concat(parts, m) .. r, hl), diff_hl)
   end
 
+  local inner = ncols - 1
+  for _, w in ipairs(widths) do
+    inner = inner + w + 2 * pad
+  end
   rule(b[1], b[2], b[3], cfg.head)
-  for r, row in ipairs(data.rows) do
-    local header = row.node.type == "pipe_table_header"
-    local hl = header and cfg.head or cfg.row
-    local cells, height = {}, 1
-    for c = 1, ncols do
-      cells[c] = M.wrap(rows[r][c], widths[c])
-      height = math.max(height, #cells[c])
-    end
-    for l = 1, height do
-      local line = new_line():text(b[10], hl)
-      for c = 1, ncols do
-        local chunks = cells[c][l] or {}
-        local fill = widths[c] - line_width(chunks)
-        local align = data.cols[c].alignment
-        local left = align == "right" and fill or align == "center" and math.floor(fill / 2) or 0
-        line:pad(pad + left)
+  for _, e in ipairs(entries) do
+    if e.rule then
+      rule(b[4], b[5], b[6], cfg.head, true, e.hl)
+    elseif e.raw then
+      for _, chunks in ipairs(M.wrap(e.raw, inner)) do
+        local line = new_line():text(b[10], cfg.row)
         for _, chunk in ipairs(chunks) do
           line:text(chunk[1], chunk[2])
         end
-        line:pad(pad + fill - left):text(b[10], hl)
+        push(line:pad(inner - line_width(chunks)):text(b[10], cfg.row), e.hl)
       end
-      virt[#virt + 1] = line:get()
-    end
-    if header then
-      rule(b[4], b[5], b[6], cfg.head, true)
+    else
+      local hl = e.header and cfg.head or cfg.row
+      local cells, height = {}, 1
+      for c = 1, ncols do
+        cells[c] = M.wrap(e[c] or {}, widths[c])
+        height = math.max(height, #cells[c])
+      end
+      for l = 1, height do
+        local line = new_line():text(b[10], hl)
+        for c = 1, ncols do
+          local chunks = cells[c][l] or {}
+          local fill = widths[c] - line_width(chunks)
+          local align = data.cols[c].alignment
+          local left = align == "right" and fill or align == "center" and math.floor(fill / 2) or 0
+          line:pad(pad + left)
+          for _, chunk in ipairs(chunks) do
+            line:text(chunk[1], chunk[2])
+          end
+          line:pad(pad + fill - left):text(b[10], hl)
+        end
+        push(line, e.hl)
+      end
     end
   end
   rule(b[7], b[8], b[9], cfg.row)
 
   -- virt_lines must sit on a visible line: the one after the table, else the one before.
-  local first, last = data.rows[1].node.start_row, data.rows[#data.rows].node.start_row
   local anchor, above
   if last + 1 < vim.api.nvim_buf_line_count(ctx.buf) then
     anchor, above = last + 1, true
@@ -361,6 +458,8 @@ function M._check()
   assert(M.words("`a \\| b`")[2][1][1] == "|", "\\| unescaped inside code")
   words = M.words("**x** y", "H")
   assert(vim.deep_equal(words[1][1], { "x", { "H", "@markup.strong" } }) and words[2][1][2] == "H", vim.inspect(words))
+  assert(vim.deep_equal(M.split_row("| a | b\\|c |"), { " a ", " b\\|c " }), vim.inspect(M.split_row("| a | b\\|c |")))
+  assert(vim.deep_equal(M.split_row("a | b"), { "a ", " b" }))
   print("md_table_wrap: ok")
 end
 

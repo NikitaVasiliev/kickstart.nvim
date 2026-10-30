@@ -4,13 +4,14 @@ return {
     cmd = "Neogit",
     dependencies = {
       "nvim-lua/plenary.nvim",
-      "sindrets/diffview.nvim",
+      "dlyongemallo/diffview.nvim",
       "nvim-telescope/telescope.nvim",
     },
     config = true,
   },
   {
-    "sindrets/diffview.nvim",
+    -- maintained fork: adds the diff1_inline (unified) layout
+    "dlyongemallo/diffview.nvim",
     cmd = {
       "DiffviewOpen",
       "DiffviewFileHistory",
@@ -86,6 +87,9 @@ return {
         return {
           view = {
             default = { layout = layout },
+            -- g<C-x> toggles side-by-side <-> Bitbucket-style unified diff
+            cycle_layouts = { default = { layout, "diff1_inline" } },
+            inline = { deletion_highlight = "full_width" },
             file_history = { layout = layout },
             merge_tool = {
               layout = portrait and "diff3_vertical" or "diff3_horizontal",
@@ -110,6 +114,7 @@ return {
       end
       require("diffview").setup(diffview_opts())
       require("diffview_checked").setup()
+      require("diffview_inline_wrap").setup()
       vim.api.nvim_create_autocmd("VimResized", {
         callback = function()
           require("diffview").setup(diffview_opts())
